@@ -84,13 +84,32 @@ cd oma-server
 ```
 
 The installer:
-1. Installs the plugin into `~/.config/omarchy/plugins/server-mode/`.
+1. Installs the core CLI plugin into `~/.config/omarchy/plugins/server-mode/`.
 2. Symlinks `oma-server` into `~/.local/bin/`.
 3. Installs the boot recovery hook into `~/.config/omarchy/hooks/post-boot.d/`.
+4. Installs the Quickshell bar widget into `~/.config/omarchy/plugins/rohirik.oma-server/`.
+
+To add the widget to your Omarchy status bar:
+```bash
+omarchy bar move rohirik.oma-server --section right
+```
 
 ---
 
-## 💻 Usage
+## 🖥️ Status Bar Widget & Action Menu
+
+`oma-server` includes a native Quickshell bar widget:
+
+* **Icon State**: Displays `💻` in Laptop Mode, and turns to active `⚡` in Homelab Mode.
+* **Left-Click**: One-click toggle between Laptop and Homelab mode.
+* **Right-Click**: Opens a quick actions menu:
+  * 💻 / ⚡ Toggle Mode
+  * 🔍 Preview Transition Diff (opens terminal preview)
+  * 🚨 Emergency Reset (rescue)
+
+---
+
+## 💻 CLI Usage
 
 ### 1. Check Current Status
 ```bash

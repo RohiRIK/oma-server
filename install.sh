@@ -33,6 +33,13 @@ echo "==> Linking binaries in $BIN_DIR"
 ln -sf "$TARGET_DIR/bin/omarchy-server-mode" "$BIN_DIR/oma-server"
 ln -sf "$TARGET_DIR/bin/omarchy-server-mode" "$BIN_DIR/omarchy-server-mode"
 
+# Install Omarchy shell bar-widget plugin
+SHELL_PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/rohirik.oma-server"
+echo "==> Installing Omarchy shell bar widget to: $SHELL_PLUGIN_DIR"
+mkdir -p "$SHELL_PLUGIN_DIR"
+cp "$SCRIPT_DIR/manifest.json" "$SCRIPT_DIR/BarWidget.qml" "$SHELL_PLUGIN_DIR/"
+
 echo ""
 echo "[OK] oma-server successfully installed!"
-echo "Run 'oma-server status' or 'oma-server diff' to verify."
+echo "• Run 'oma-server status' or 'oma-server diff' to verify CLI."
+echo "• Add widget to your bar with: omarchy bar move rohirik.oma-server --section right"

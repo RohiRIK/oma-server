@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "rohirik.oma-server",
+  "name": "Oma Server",
+  "version": "1.0.0",
+  "author": "RohiRIK",
+  "license": "MIT",
+  "description": "Dynamic Performance/Homelab Mode Switcher for Omarchy with status bar button, popup menu, and CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Oma Server",
+    "description": "Dynamic Homelab / Laptop mode switcher with status indicator and action menu.",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
