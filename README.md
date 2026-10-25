@@ -1,10 +1,39 @@
-# oma-server 🚀
+<p align="center">
+  <img src="assets/banner.png" alt="oma-server banner" width="100%">
+</p>
 
-> **Dynamic Performance/Homelab Mode Switcher for Omarchy (Arch + Hyprland + Quickshell)**
+<p align="center">
+  <img src="assets/logo.png" alt="oma-server logo" width="110px"><br>
+  <strong>Dynamic Performance/Homelab Mode Switcher for Omarchy (Arch + Hyprland + Quickshell)</strong>
+</p>
 
-`oma-server` (Omarchy Server-Mode) allows your Omarchy laptop or workstation to dynamically toggle between a rich consumer desktop and an optimized, high-throughput homelab node without requiring a logout, session restart, or reboot.
+<p align="center">
+  <a href="#-the-origin--motivation">Origin & Motivation</a> •
+  <a href="#-highlights">Highlights</a> •
+  <a href="#️-architecture--philosophy">Architecture</a> •
+  <a href="#-installation">Installation</a> •
+  <a href="#-usage">Usage</a> •
+  <a href="#️-configuration">Configuration</a>
+</p>
 
-When intensive homelab tasks, container workloads, or headless jobs run, `oma-server` safely sheds graphical overhead, pauses the status bar, and inhibits OS sleep—while strictly safeguarding core homelab daemons.
+---
+
+## 💡 The Origin & Motivation
+
+> *"I genuinely love working in Omarchy with the GUI, the fluid Hyprland animations, and the Quickshell bar. But when I'm remote over SSH or letting autonomous AI agents churn through heavy tasks, I don't need any of it."*
+
+Omarchy delivers one of the most aesthetically pleasing, modern Linux desktop experiences available. For interactive daily-driver work, the blur shaders, high-refresh animations, rich status panels, and audio subsystems are a joy to use.
+
+However, a modern workstation often leads a **double life**:
+1. **Interactive Station**: When sitting directly in front of the machine, visual polish, low input latency, and desktop comfort are everything.
+2. **Compute Node / Agent Runner**: When stepping away, SSHing in from a laptop, or turning the machine over to heavy workloads (autonomous AI agents, container clusters, multi-hour compiles, or media transcoding), the desktop GUI becomes pure deadweight.
+
+Leaving full Hyprland compositing, display panels, and status bar polling active when you are working remotely:
+* **Wastes 15–30W of power** keeping physical display panels powered.
+* **Consumes GPU memory bandwidth** and compute shaders calculating window beziers and multi-pass blurs that no one is watching.
+* **Triggers power management sleep loops** on lid-close or idle timeouts, which can abruptly terminate SSH sessions and agent runs.
+
+**`oma-server` was built to eliminate this compromise.** It gives you the best of both worlds: a full-throttle, headless homelab workhorse whenever you're remote or running agent workflows, with an instantaneous (~1s) return to your beautiful Omarchy desktop the moment you sit back down.
 
 ---
 
