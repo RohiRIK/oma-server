@@ -1,300 +1,478 @@
 #!/usr/bin/env bash
 # ~/.config/omarchy/plugins/server-mode/bin/omarchy-server-mode
-# Core CLI coordinator for oma-server (Omarchy Server-Mode)
+# Enterprise CLI coordinator for oma-server (Omarchy Server-Mode)
 set -euo pipefail
 
-# 1. Startup pre-flight dependency audit
-for dep in jq hyprctl flock date pgrep; do
+readonly OMA_SERVER_VERSION="1.1.0"
+
+# 1. Startup Pre-Flight Dependency Audit
+for dep in jq hyprctl flock date pgrep awk sed tr; do
     if ! command -v "$dep" >/dev/null 2>&1; then
-        echo "Error: Required system tool '$dep' was not found in PATH." >&2
+        printf "[ FAIL ] Required system dependency '%s' was not found in PATH.\n" "$dep" >&2
         exit 1
     fi
 done
 
-# 2. Directory and module path resolution
+# 2. Directory and Module Path Resolution
 CMD_NAME="$(basename "$0")"
 REAL_SCRIPT="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$REAL_SCRIPT")" &>/dev/null && pwd)"
 PLUGIN_ROOT="$(cd -- "$SCRIPT_DIR/.." &>/dev/null && pwd)"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode/config.toml"
+if [[ ! -f "$CONFIG_FILE" && -f "$PLUGIN_ROOT/config/config.toml" ]]; then
+    CONFIG_FILE="$PLUGIN_ROOT/config/config.toml"
+fi
 LIB_DIR="$PLUGIN_ROOT/lib"
 
-if [[ ! -f "$LIB_DIR/snapshot.sh" ]]; then
-    echo "Error: Required library '$LIB_DIR/snapshot.sh' not found." >&2
-    exit 1
-fi
-if [[ ! -f "$LIB_DIR/transition.sh" ]]; then
-    echo "Error: Required library '$LIB_DIR/transition.sh' not found." >&2
-    exit 1
-fi
+for lib_mod in ui.sh config.sh snapshot.sh transition.sh; do
+    if [[ ! -f "$LIB_DIR/$lib_mod" ]]; then
+        printf "[ FAIL ] Required library '%s/%s' not found.\n" "$LIB_DIR" "$lib_mod" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$LIB_DIR/$lib_mod"
+done
 
-# shellcheck source=/dev/null
-source "$LIB_DIR/snapshot.sh"
-# shellcheck source=/dev/null
-source "$LIB_DIR/transition.sh"
+# 3. Validate User & Session Scoping (Strictly inside ephemeral /run/user/${UID})
+validate_runtime_environment
 
-# 3. User & Session Scoping (Strictly inside ephemeral /run/user/${UID})
-RUN_DIR="/run/user/${UID}/omarchy-server-mode"
+CURRENT_UID="${UID:-$(id -u)}"
+RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
 SNAPSHOT_FILE="$RUN_DIR/active-snapshot.json"
 LOCK_FILE="$RUN_DIR/lock"
 
-# 4. Helper: Extract whitelist entries from config.toml
-get_whitelist_services() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        sed -n '/^\[whitelist\]/,/^\[/p' "$CONFIG_FILE" \
-            | grep -oE '"[^"]+"' \
-            | tr -d '"' || true
-    else
-        cat <<EOF
-docker.service
-containerd.service
-podman.service
-tailscaled.service
-syncthing.service
-caddy.service
-nginx.service
-sshd.service
-pipewire.service
-wireplumber.service
-EOF
-    fi
-}
+# 4. Helper: Gather Live Telemetry for Status & JSON Output
+collect_status_telemetry() {
+    local as_json="$1"
 
-# 5. Helper: Render transition diff plan table
-print_diff_table() {
-    local snapshot_json="$1"
-    local timeout_val="${2:-}"
-
-    local cur_anim cur_blur cur_shadow cur_vfr cur_dpms
-    cur_anim=$(echo "$snapshot_json" | jq -r '.compositor_properties["animations:enabled"]')
-    cur_blur=$(echo "$snapshot_json" | jq -r '.compositor_properties["decoration:blur:enabled"]')
-    cur_shadow=$(echo "$snapshot_json" | jq -r '.compositor_properties["decoration:drop_shadow"]')
-    cur_vfr=$(echo "$snapshot_json" | jq -r '.compositor_properties["misc:vfr"]')
-    cur_dpms=$(echo "$snapshot_json" | jq -r '.compositor_properties.dpms_status')
-
-    local qs_pid qs_running qs_action
-    qs_pid=$(echo "$snapshot_json" | jq -r '.quickshell_state.pid')
-    qs_running=$(echo "$snapshot_json" | jq -r '.quickshell_state.was_running')
-    qs_action=$(echo "$snapshot_json" | jq -r '.quickshell_state.action_taken')
-
-    local qs_desc
-    if [[ "$qs_running" == "true" ]]; then
-        qs_desc="Running (PID: $qs_pid)"
-    else
-        qs_desc="Not Running"
-    fi
-
-    local timeout_desc="None (Manual toggle)"
-    if [[ -n "$timeout_val" && "$timeout_val" != "0" ]]; then
-        timeout_desc="$timeout_val (Auto-restore)"
-    fi
-
-    echo ""
-    echo "================================================================================"
-    echo " OMA-SERVER: PROPOSED TRANSITION PLAN (HOST -> HOMELAB)"
-    echo "================================================================================"
-    printf "%-30s | %-20s | %-22s\n" "PROPERTY / SUBSYSTEM" "CURRENT VALUE" "PROPOSED HOMELAB VALUE"
-    echo "-------------------------------+----------------------+-------------------------"
-    printf "%-30s | %-20s | %-22s\n" "animations:enabled" "$cur_anim" "0 (Disabled)"
-    printf "%-30s | %-20s | %-22s\n" "decoration:blur:enabled" "$cur_blur" "false (Disabled)"
-    printf "%-30s | %-20s | %-22s\n" "decoration:drop_shadow" "$cur_shadow" "false (Disabled)"
-    printf "%-30s | %-20s | %-22s\n" "misc:vfr" "$cur_vfr" "1 (Enforced)"
-    printf "%-30s | %-20s | %-22s\n" "display:dpms" "$( [[ "$cur_dpms" == "true" ]] && echo "ON" || echo "OFF" )" "OFF (Panel Powerdown)"
-    printf "%-30s | %-20s | %-22s\n" "omarchy-shell (Quickshell)" "$qs_desc" "${qs_action} (Suspended)"
-    printf "%-30s | %-20s | %-22s\n" "systemd-logind inhibitor" "Inactive" "Active (Lid/Sleep Block)"
-    printf "%-30s | %-20s | %-22s\n" "dead man's switch timer" "None" "$timeout_desc"
-    echo "================================================================================"
-    echo "TIER-0 PROTECTED HOMELAB SERVICES AUDIT:"
-
-    while IFS= read -r svc; do
-        [[ -z "$svc" ]] && continue
-        local status="inactive"
-
-        # Check systemd system scope
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            status="active (system)"
-        # Check systemd user scope
-        elif systemctl --user is-active --quiet "$svc" 2>/dev/null; then
-            status="active (user)"
+    local dpms_live="ON (Active)"
+    local monitors_json=""
+    if monitors_json=$(run_with_timeout 2 hyprctl -j monitors 2>/dev/null) && [[ -n "$monitors_json" ]]; then
+        local any_dpms
+        any_dpms=$(printf "%s" "$monitors_json" | jq -r 'if (type == "array" and length > 0) then any(.[]; .dpmsStatus == true) else true end' 2>/dev/null || echo "true")
+        if [[ "$any_dpms" == "false" ]]; then
+            dpms_live="OFF (Power Saving)"
         fi
+    fi
 
-        if [[ "$status" != "inactive" ]]; then
-            printf "  [PROTECTED] %-25s -> %s\n" "$svc" "$status"
+    local qs_live
+    qs_live="$(get_quickshell_telemetry)"
+
+    local -a whitelist_units=()
+    mapfile -t whitelist_units < <(get_whitelist_services "$CONFIG_FILE")
+    local total_units="${#whitelist_units[@]}"
+    local active_units=0
+    local unit
+    for unit in "${whitelist_units[@]}"; do
+        [[ -z "$unit" ]] && continue
+        if run_with_timeout 1 systemctl is-active --quiet "$unit" 2>/dev/null || \
+           run_with_timeout 1 systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            active_units=$(( active_units + 1 ))
+        fi
+    done
+    local protected_summary="${active_units}/${total_units} active (Protected)"
+
+    if [[ -f "$SNAPSHOT_FILE" ]] && validate_snapshot "$SNAPSHOT_FILE" >/dev/null 2>&1; then
+        local ts now_epoch elapsed_sec elapsed_human date_str
+        ts=$(jq -r '.timestamp' "$SNAPSHOT_FILE" 2>/dev/null || echo "0")
+        now_epoch=$(date +%s)
+        elapsed_sec=$(( now_epoch - ts ))
+        (( elapsed_sec < 0 )) && elapsed_sec=0
+        elapsed_human="$(ui_format_duration_human "$elapsed_sec")"
+        date_str=$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "epoch:$ts")
+
+        local in_status="Inactive"
+        local health="OK"
+        if [[ -f "$RUN_DIR/inhibitor.pid" ]]; then
+            local in_pid
+            in_pid=$(tr -d '[:space:]' < "$RUN_DIR/inhibitor.pid" 2>/dev/null || true)
+            if verify_pid_identity "$in_pid" "systemd-inhibit|sleep"; then
+                in_status="Active (PID: $in_pid)"
+            else
+                in_status="Stale"
+                health="DEGRADED"
+            fi
         else
-            printf "  [UNTOUCHED] %-25s -> inactive (will remain untouched)\n" "$svc"
+            in_status="Inactive"
+            health="DEGRADED"
         fi
-    done < <(get_whitelist_services)
-    echo "================================================================================"
+
+        local timeout_pid=""
+        local timeout_status="Disabled (Manual Mode)"
+        local timeout_remaining=""
+        if [[ -f "$RUN_DIR/timeout.pid" ]]; then
+            timeout_pid=$(tr -d '[:space:]' < "$RUN_DIR/timeout.pid" 2>/dev/null || true)
+            if verify_pid_identity "$timeout_pid" "oma-server|omarchy-server|bash|sleep"; then
+                if [[ -f "$RUN_DIR/timeout.meta" ]]; then
+                    local t_label t_exp rem_sec
+                    IFS='|' read -r t_label t_exp < "$RUN_DIR/timeout.meta" || true
+                    if [[ "${t_exp:-0}" =~ ^[0-9]+$ ]] && (( t_exp > now_epoch )); then
+                        rem_sec=$(( t_exp - now_epoch ))
+                        timeout_remaining="$(ui_format_duration_human "$rem_sec")"
+                        timeout_status="Active (${t_label}, ${timeout_remaining} left)"
+                    else
+                        timeout_status="Active (PID: $timeout_pid)"
+                    fi
+                else
+                    timeout_status="Active (PID: $timeout_pid)"
+                fi
+            else
+                timeout_pid=""
+            fi
+        fi
+
+        if [[ "$as_json" == "true" ]]; then
+            jq -n \
+              --arg mode "HOMELAB_MODE" \
+              --argjson is_homelab true \
+              --arg since "$date_str" \
+              --argjson elapsed_seconds "$elapsed_sec" \
+              --arg elapsed_human "$elapsed_human" \
+              --arg inhibitor "$in_status" \
+              --arg timeout "${timeout_pid:-null}" \
+              --arg timeout_status "$timeout_status" \
+              --arg timeout_remaining "${timeout_remaining:-}" \
+              --arg dpms "$dpms_live" \
+              --arg quickshell "$qs_live" \
+              --argjson protected_active "$active_units" \
+              --argjson protected_total "$total_units" \
+              --arg health "$health" \
+              --arg runtime "$RUN_DIR" \
+              '{
+                mode: $mode,
+                is_homelab: $is_homelab,
+                since: $since,
+                elapsed_seconds: $elapsed_seconds,
+                elapsed_human: $elapsed_human,
+                inhibitor: $inhibitor,
+                timeout: (if $timeout == "null" or $timeout == "" then null else $timeout end),
+                timeout_status: $timeout_status,
+                timeout_remaining: $timeout_remaining,
+                dpms: $dpms,
+                quickshell: $quickshell,
+                protected_active: $protected_active,
+                protected_total: $protected_total,
+                health: $health,
+                runtime_state: $runtime
+              }'
+            return 0
+        fi
+
+        ui_render_status_panel \
+            "HOMELAB_MODE" \
+            "true" \
+            "$date_str" \
+            "$elapsed_human" \
+            "$in_status" \
+            "$timeout_status" \
+            "$dpms_live" \
+            "$qs_live" \
+            "$RUN_DIR" \
+            "$protected_summary" \
+            "$health"
+
+        if [[ "$health" == "DEGRADED" ]]; then
+            echo ""
+            ui_log_warn "Inhibitor process is stale or missing while Homelab snapshot is active." \
+                "Run '$CMD_NAME rescue' or '$CMD_NAME disable' to resynchronize system state."
+        fi
+        return 0
+    fi
+
+    if [[ "$as_json" == "true" ]]; then
+        jq -n \
+          --arg mode "HOST_LAPTOP" \
+          --argjson is_homelab false \
+          --arg inhibitor "Inactive" \
+          --arg timeout_status "Standby" \
+          --arg dpms "$dpms_live" \
+          --arg quickshell "$qs_live" \
+          --argjson protected_active "$active_units" \
+          --argjson protected_total "$total_units" \
+          --arg health "OK" \
+          '{
+            mode: $mode,
+            is_homelab: $is_homelab,
+            since: null,
+            elapsed_seconds: 0,
+            elapsed_human: "00h 00m 00s",
+            inhibitor: $inhibitor,
+            timeout: null,
+            timeout_status: $timeout_status,
+            timeout_remaining: "",
+            dpms: $dpms,
+            quickshell: $quickshell,
+            protected_active: $protected_active,
+            protected_total: $protected_total,
+            health: $health,
+            runtime_state: null
+          }'
+        return 0
+    fi
+
+    ui_render_status_panel \
+        "HOST_LAPTOP" \
+        "false" \
+        "N/A (Desktop Profile Active)" \
+        "00h 00m 00s" \
+        "Inactive (Standard Power Policy)" \
+        "Inactive" \
+        "$dpms_live" \
+        "$qs_live" \
+        "None (Clean)" \
+        "$protected_summary" \
+        "OK"
 }
 
-# 6. CLI Command Parser
+print_usage() {
+    local w=76
+    printf "\n%s┌%s┐%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
+    printf "%s│%s  %sOMA-SERVER v%s // PERFORMANCE & HOMELAB MODE ORCHESTRATOR%s%*s%s│%s\n" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_WHITE}" "$OMA_SERVER_VERSION" "${UI_RESET}" 16 "" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
+    printf "%s│%s  %sUSAGE:%s   %-65s%s│%s\n" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "${UI_RESET}" "$CMD_NAME <command> [options]" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
+    printf "%s│%s  %sCOMMANDS:%s%*s%s│%s\n" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_MUTED}" "${UI_RESET}" 65 "" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "status [--json]" "Display live telemetry panel or JSON payload" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "diff" "Render in-memory transition plan & Tier-0 audit" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "enable [options]" "Transition from HOST_LAPTOP to HOMELAB_MODE" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "disable" "Restore full desktop session & release locks" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "rescue" "Force emergency recovery to safe baseline" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
+    printf "%s│%s  %sENABLE OPTIONS:%s%*s%s│%s\n" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_MUTED}" "${UI_RESET}" 59 "" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "--dry-run" "Simulate transition in memory without changes" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "-y, --yes" "Skip interactive confirmation prompt" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "--timeout <duration>" "Auto-revert Dead Man's Switch (e.g. 45m, 2h)" "${UI_CYAN}" "${UI_RESET}"
+    printf "%s└%s┘%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
+}
+
+# 5. CLI Command Dispatcher
 cmd="${1:-}"
 
 case "$cmd" in
     status)
-        # Check for presence of lock and valid snapshot in /run/user/${UID}/
-        if [[ -f "$LOCK_FILE" && -f "$SNAPSHOT_FILE" ]]; then
-            if validate_snapshot "$SNAPSHOT_FILE" >/dev/null 2>&1; then
-                local ts date_str in_status in_pid
-                ts=$(jq -r '.timestamp' "$SNAPSHOT_FILE" 2>/dev/null || echo "0")
-                date_str=$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "epoch:$ts")
-
-                if [[ -f "$RUN_DIR/inhibitor.pid" ]]; then
-                    in_pid=$(cat "$RUN_DIR/inhibitor.pid" 2>/dev/null || true)
-                    if [[ -n "$in_pid" ]] && kill -0 "$in_pid" 2>/dev/null; then
-                        in_status="Active (PID: $in_pid)"
-                    else
-                        in_status="Stale"
-                    fi
-                else
-                    in_status="Inactive"
-                fi
-
-                echo "[MODE] HOMELAB_MODE (Active since $date_str)"
-                echo "  • Power Inhibitor: $in_status"
-                echo "  • Runtime State:   $RUN_DIR"
-                if [[ -f "$RUN_DIR/timeout.pid" ]]; then
-                    echo "  • Timeout Guard:   Active (PID: $(cat "$RUN_DIR/timeout.pid" 2>/dev/null || true))"
-                fi
-                exit 0
-            fi
-        fi
-        echo "[MODE] HOST_LAPTOP (Default desktop profile active)"
+        shift || true
+        as_json="false"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json)
+                    as_json="true"
+                    shift
+                    ;;
+                *)
+                    ui_log_fail "Unknown option '$1' for 'status' command." "Supported flag: --json"
+                    exit 1
+                    ;;
+            esac
+        done
+        collect_status_telemetry "$as_json"
         exit 0
         ;;
 
     diff)
-        # In-memory execution: ZERO disk writes or system mutations
-        snapshot_in_memory=$(capture_snapshot "sigstop")
-        print_diff_table "$snapshot_in_memory" ""
+        shift || true
+        if [[ $# -gt 0 ]]; then
+            ui_log_fail "Unexpected argument '$1' for 'diff' command." "Run '$CMD_NAME diff' with no arguments."
+            exit 1
+        fi
+        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
+        mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
+        ui_render_diff_panel "$snapshot_in_memory" "" "${services[@]}"
         exit 0
         ;;
 
     enable)
-        is_dry_run=false
+        is_dry_run="false"
+        skip_confirm="false"
         timeout_arg=""
         shift || true
 
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --dry-run)
-                    is_dry_run=true
+                    is_dry_run="true"
+                    shift
+                    ;;
+                -y|--yes)
+                    skip_confirm="true"
                     shift
                     ;;
                 --timeout)
+                    if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+                        ui_log_fail "Missing duration value for '--timeout' flag." \
+                            "Provide a duration such as '--timeout 30m' or '--timeout 2h'."
+                        exit 1
+                    fi
                     timeout_arg="$2"
                     shift 2
                     ;;
+                --timeout=*)
+                    timeout_arg="${1#--timeout=}"
+                    if [[ -z "$timeout_arg" ]]; then
+                        ui_log_fail "Empty duration value in '$1'." \
+                            "Provide a duration such as '--timeout=30m' or '--timeout=2h'."
+                        exit 1
+                    fi
+                    shift
+                    ;;
                 *)
-                    echo "Error: Unknown option '$1' for enable command." >&2
+                    ui_log_fail "Unknown option '$1' for 'enable' command." \
+                        "Valid options: --dry-run, -y, --yes, --timeout <duration>."
                     exit 1
                     ;;
             esac
         done
 
-        # If already in homelab mode, notify user
-        if [[ -f "$LOCK_FILE" && -f "$SNAPSHOT_FILE" ]] && validate_snapshot "$SNAPSHOT_FILE" >/dev/null 2>&1; then
-            echo "System is already in HOMELAB_MODE. Use '$CMD_NAME disable' to restore desktop mode."
+        # Fallback to config default_timeout if not supplied on CLI
+        if [[ -z "$timeout_arg" ]]; then
+            timeout_arg="$(config_get_scalar "$CONFIG_FILE" "profile" "default_timeout" "0")"
+        fi
+
+        # Validate timeout schema before any state inspection or mutation
+        timeout_seconds="$(parse_and_validate_timeout "$timeout_arg")"
+
+        # Check if already in HOMELAB_MODE
+        if [[ -f "$SNAPSHOT_FILE" ]] && validate_snapshot "$SNAPSHOT_FILE" >/dev/null 2>&1; then
+            ui_log_info "System is already operating in HOMELAB_MODE."
+            printf "         %s└─ Tip:%s Run '%s disable' to restore HOST_LAPTOP profile.\n" "${UI_MUTED}" "${UI_RESET}" "$CMD_NAME"
             exit 0
         fi
 
-        # In-memory snapshot generation
-        snapshot_in_memory=$(capture_snapshot "sigstop")
+        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
+        mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
 
-        if [[ "$is_dry_run" == true ]]; then
-            print_diff_table "$snapshot_in_memory" "$timeout_arg"
+        if [[ "$is_dry_run" == "true" ]]; then
+            ui_render_diff_panel "$snapshot_in_memory" "$timeout_arg" "${services[@]}"
             echo ""
-            echo "[DRY-RUN COMPLETE] No changes were made to the system."
+            ui_log_ok "Dry-run simulation complete. Zero system mutations were applied."
             exit 0
         fi
 
-        # Interactive confirmation path
-        print_diff_table "$snapshot_in_memory" "$timeout_arg"
-        echo ""
-        read -r -p "Ready to apply Homelab Mode. Proceed? [y/N] " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            echo "Operation cancelled by user. No modifications were made."
-            exit 0
+        if [[ "$skip_confirm" == "false" ]]; then
+            if [[ ! -t 0 ]]; then
+                ui_log_fail "Interactive confirmation required, but standard input is not a TTY." \
+                    "Pass '-y' or '--yes' for non-interactive execution."
+                exit 1
+            fi
+            ui_render_diff_panel "$snapshot_in_memory" "$timeout_arg" "${services[@]}"
+            echo ""
+            printf "%s Confirm transition from HOST_LAPTOP to HOMELAB_MODE? [y/N]: " "$(ui_badge_info)"
+            read -r confirm || confirm="n"
+            if [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]]; then
+                ui_log_info "Transition cancelled by user. System remains in HOST_LAPTOP mode."
+                exit 0
+            fi
         fi
 
-        # Create session runtime directory (tmpfs, user-only permissions)
-        mkdir -p "$RUN_DIR"
-        chmod 700 "$RUN_DIR"
+        op_start_ms="$(ui_now_ms)"
+        ensure_secure_run_dir "$RUN_DIR"
 
-        # Acquire exclusive lock
+        # Acquire exclusive non-blocking transaction lock
         exec 200>"$LOCK_FILE"
         if ! flock -n 200; then
-            echo "Error: Another process currently holds the lock at '$LOCK_FILE'." >&2
+            ui_log_fail "Another oma-server operation holds the transaction lock at '$LOCK_FILE'." \
+                "Wait for the active transition to complete or run '$CMD_NAME rescue'."
             exit 1
         fi
 
-        # Write atomic snapshot to tmpfs
-        echo "$snapshot_in_memory" > "$SNAPSHOT_FILE"
-        chmod 600 "$SNAPSHOT_FILE"
-
-        # Validate written artifact
-        if ! validate_snapshot "$SNAPSHOT_FILE"; then
-            echo "Error: Snapshot validation failed after write. Removing invalid artifact." >&2
-            rm -f "$SNAPSHOT_FILE"
+        if ! write_snapshot_atomic "$snapshot_in_memory" "$SNAPSHOT_FILE"; then
+            ui_log_fail "Atomic snapshot write/validation failed at '$SNAPSHOT_FILE'." \
+                "Verify free space in '$RUN_DIR' (tmpfs)."
+            rm -f "$LOCK_FILE"
             exit 1
         fi
 
-        # Phase 2: Apply mutations and inhibitors
-        apply_homelab_mode "$RUN_DIR" "$CONFIG_FILE" "$SNAPSHOT_FILE" "$timeout_arg" "$REAL_SCRIPT"
+        if ! apply_homelab_mode "$RUN_DIR" "$CONFIG_FILE" "$SNAPSHOT_FILE" "$timeout_seconds" "$timeout_arg" "$REAL_SCRIPT"; then
+            rm -f "$LOCK_FILE"
+            exit 1
+        fi
 
+        # Release transaction lock FD cleanly now that state transition is complete
+        exec 200>&- || true
+
+        op_elapsed="$(ui_format_elapsed_ms "$op_start_ms")"
         echo ""
-        echo "[OK] System successfully transitioned to HOMELAB_MODE."
-        echo "Tip: Run '$CMD_NAME disable' or touch physical mouse/keyboard to wake."
+        ui_log_ok "System transitioned to HOMELAB_MODE in ${op_elapsed}."
+        printf "       %s└─ Wake / Restore:%s Run '%s disable' or move mouse/keyboard to wake display.\n" \
+            "${UI_MUTED}" "${UI_RESET}" "$CMD_NAME"
         exit 0
         ;;
 
     disable)
         shift || true
-        is_auto_timeout=false
-        if [[ "${1:-}" == "--auto-timeout" ]]; then
-            is_auto_timeout=true
-        fi
+        is_auto_timeout="false"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --auto-timeout)
+                    is_auto_timeout="true"
+                    shift
+                    ;;
+                *)
+                    ui_log_fail "Unknown option '$1' for 'disable' command." "Run '$CMD_NAME disable'."
+                    exit 1
+                    ;;
+            esac
+        done
 
         if [[ ! -f "$SNAPSHOT_FILE" ]]; then
-            echo "Notice: System is already in HOST_LAPTOP mode (no active snapshot found)."
+            ui_log_info "System is already operating in HOST_LAPTOP mode (no active snapshot)."
             exit 0
         fi
 
-        if [[ "$is_auto_timeout" == true ]]; then
-            echo "==> [AUTO-TIMEOUT] Dead man's switch timer expired. Restoring desktop profile..."
-        else
-            echo "==> Initiating restoration to HOST_LAPTOP mode..."
+        op_start_ms="$(ui_now_ms)"
+        ensure_secure_run_dir "$RUN_DIR"
+
+        exec 200>"$LOCK_FILE"
+        if ! flock -w 5 200; then
+            ui_log_warn "Transaction lock contention detected; proceeding with forced restoration."
         fi
 
-        # Phase 3: Restore host desktop state
+        if [[ "$is_auto_timeout" == "true" ]]; then
+            ui_log_warn "Dead Man's Switch timer expired. Auto-restoring HOST_LAPTOP profile..."
+        fi
+
         restore_host_mode "$RUN_DIR" "$SNAPSHOT_FILE"
 
-        # Release lock file
+        exec 200>&- 2>/dev/null || true
         rm -f "$LOCK_FILE"
 
+        op_elapsed="$(ui_format_elapsed_ms "$op_start_ms")"
         echo ""
-        echo "[OK] Desktop successfully restored to HOST_LAPTOP mode."
+        ui_log_ok "Desktop restored to HOST_LAPTOP mode in ${op_elapsed}."
         exit 0
         ;;
 
     rescue)
-        echo "==> Triggering Emergency Rescue Recovery..."
+        shift || true
+        op_start_ms="$(ui_now_ms)"
         force_rescue_mode "$RUN_DIR" "$SNAPSHOT_FILE"
+        op_elapsed="$(ui_format_elapsed_ms "$op_start_ms")"
         echo ""
-        echo "[OK] Emergency rescue complete. System restored to safe baseline."
+        ui_log_ok "Emergency rescue complete in ${op_elapsed}. System restored to safe baseline."
+        exit 0
+        ;;
+
+    version|--version|-v)
+        printf "oma-server v%s\n" "$OMA_SERVER_VERSION"
+        exit 0
+        ;;
+
+    help|--help|-h|"")
+        print_usage
+        if [[ -z "$cmd" ]]; then
+            exit 1
+        fi
         exit 0
         ;;
 
     *)
-        echo "Usage: $CMD_NAME <command> [options]"
-        echo ""
-        echo "Commands:"
-        echo "  status                   Report current mode (HOST vs HOMELAB) and active inhibitors"
-        echo "  diff                     Show in-memory diff between current host state and homelab mode"
-        echo "  enable [--dry-run]       Transition to Homelab Mode (--dry-run for simulation)"
-        echo "         [--timeout <val>] Optional auto-revert timer (e.g. 2h, 45m)"
-        echo "  disable                  Restore full Host/Laptop desktop session and release locks"
-        echo "  rescue                   Emergency fallback to unfreeze shell, wake screen, and reset"
+        ui_log_fail "Unrecognized command '$cmd'." "Run '$CMD_NAME --help' for usage details."
+        print_usage
         exit 1
         ;;
 esac

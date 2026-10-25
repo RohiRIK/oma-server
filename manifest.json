@@ -2,19 +2,22 @@
   "schemaVersion": 1,
   "id": "rohirik.oma-server",
   "name": "Oma Server",
-  "version": "1.0.0",
-  "author": "RohiRIK",
+  "version": "1.1.0",
+  "author": "Rohi Rikman",
   "license": "MIT",
-  "description": "Dynamic Performance/Homelab Mode Switcher for Omarchy with status bar button, popup menu, and CLI.",
+  "repository": "https://github.com/RohiRIK/oma-server",
+  "homepage": "https://github.com/RohiRIK/oma-server",
+  "description": "Enterprise Performance & Homelab Mode Orchestrator for Omarchy: transactional mode transitions, PID-verified sleep inhibitors, DPMS powerdown, Dead Man's Switch timers, and native Quickshell telemetry panel.",
   "kinds": [
     "bar-widget"
   ],
+  "activation": "on-demand",
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Oma Server",
-    "description": "Dynamic Homelab / Laptop mode switcher with status indicator and action menu.",
+    "description": "Dynamic Homelab / Laptop mode switcher with live telemetry panel and safety guardrails.",
     "category": "System",
     "defaultSection": "right",
     "allowMultiple": false
