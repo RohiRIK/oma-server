@@ -1,0 +1,28 @@
+# ~/.config/omarchy/plugins/server-mode/config.toml
+# Declarative policy and service definitions for Omarchy Server-Mode (oma-server)
+
+[profile]
+default_mode = "host"
+dpms_off_on_enable = true
+auto_wake_on_input = true
+quickshell_strategy = "sigstop"
+default_timeout = "0"              # "0" = infinite, or e.g. "2h", "45m"
+
+[inhibit]
+what = "sleep:idle:handle-lid-switch"
+why = "Omarchy Homelab Workload Active"
+
+[whitelist]
+# Tier-0 protected services: Guaranteed untouched during mode switches
+services = [
+  "docker.service",
+  "containerd.service",
+  "podman.service",
+  "tailscaled.service",
+  "syncthing.service",
+  "caddy.service",
+  "nginx.service",
+  "sshd.service",
+  "pipewire.service",
+  "wireplumber.service"
+]
