@@ -100,12 +100,17 @@ omarchy bar move rohirik.oma-server --section right
 
 `oma-server` includes a native Quickshell bar widget:
 
-* **Icon State**: Displays `💻` in Laptop Mode, and turns to active `⚡` in Homelab Mode.
+<p align="center">
+  <img src="preview.png" alt="Oma Server Menu Component Preview" width="85%">
+</p>
+
+* **Icon State**: Displays `💻` in Laptop Mode, and turns to active glowing `⚡` in Homelab Mode.
 * **Left-Click**: One-click toggle between Laptop and Homelab mode.
 * **Right-Click**: Opens a quick actions menu:
-  * 💻 / ⚡ Toggle Mode
-  * 🔍 Preview Transition Diff (opens terminal preview)
-  * 🚨 Emergency Reset (rescue)
+  * 💻 / ⚡ Toggle Mode (Desktop vs. Homelab)
+  * 🔍 Preview Transition Diff (opens floating terminal preview)
+  * ⏱️ Schedule Auto-Revert Timeout (Dead Man's Switch)
+  * 🚨 Emergency Reset (Rescue Mode)
 
 ---
 
