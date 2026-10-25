@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 BarWidget {
@@ -23,7 +24,7 @@ BarWidget {
       if (isHomelabMode) {
         root.bar.run("oma-server disable")
       } else {
-        root.bar.run("omarchy-launch-floating-terminal-with-presentation oma-server enable")
+        root.bar.run("oma-server enable -y")
       }
     }
   }
@@ -36,7 +37,7 @@ BarWidget {
 
   function runRescue() {
     if (root.bar) {
-      root.bar.run("omarchy-launch-floating-terminal-with-presentation oma-server rescue")
+      root.bar.run("oma-server rescue")
     }
   }
 
@@ -63,7 +64,7 @@ BarWidget {
   }
 
   Timer {
-    interval: 5000
+    interval: 3000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -74,36 +75,34 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.isHomelabMode ? "⚡" : "💻"
+    text: "󰒋"
     active: root.isHomelabMode
-    tooltipText: "Oma Server: " + root.statusSummary + "\nLeft-click: Toggle mode\nRight-click: Actions menu"
+    tooltipText: "Oma Server: " + root.statusSummary + "\nClick to open actions menu"
     onPressed: function(b) {
-      if (b === Qt.RightButton) {
-        contextMenu.popup()
-      } else {
-        root.toggleMode()
-      }
+      contextMenu.popup()
     }
   }
 
   Menu {
     id: contextMenu
     title: "Oma Server"
+    palette.window: Commons.Color.background
+    palette.windowText: Commons.Color.foreground
 
     MenuItem {
-      text: root.isHomelabMode ? "💻 Switch to Laptop Mode" : "⚡ Switch to Homelab Mode"
+      text: root.isHomelabMode ? "󰌢  Return to Laptop Mode" : "󱐋  Switch to Homelab Mode"
       onTriggered: root.toggleMode()
     }
 
     MenuItem {
-      text: "🔍 Preview Transition Diff"
+      text: "🔍  Preview Transition Diff"
       onTriggered: root.runDiff()
     }
 
     MenuSeparator {}
 
     MenuItem {
-      text: "🚨 Emergency Reset (Rescue)"
+      text: "🚨  Emergency Reset (Rescue)"
       onTriggered: root.runRescue()
     }
   }
