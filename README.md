@@ -91,6 +91,8 @@ The installer performs pre-flight artifact validation and:
 3. Installs the post-boot safety recovery hook into `~/.config/omarchy/hooks/post-boot.d/99-server-profile-check.sh`.
 4. Installs and registers the Quickshell bar widget in `~/.config/omarchy/plugins/rohirik.oma-server/` (removing any deprecated `BarWidget.qml` from older versions).
 
+If the installer runs outside the graphical session (for example over SSH, with no `WAYLAND_DISPLAY` / `HYPRLAND_INSTANCE_SIGNATURE`), it does **not** restart `omarchy-shell` (a restart from SSH would leave the desktop without a bar); it only asks the running shell to rescan plugins. If registering the widget fails, the installer says so and exits non-zero instead of reporting a complete install; if no shell is running it prints a warning. In both cases run the enable command below from a terminal inside the desktop session.
+
 To enable and place the widget in the Omarchy status bar:
 ```bash
 omarchy plugin enable rohirik.oma-server --section right
@@ -99,9 +101,14 @@ omarchy plugin enable rohirik.oma-server --section right
 
 ### Uninstallation
 
-To cleanly restore `HOST_LAPTOP` mode, disable the bar widget, and remove all installed files and hooks:
+To cleanly restore `HOST_LAPTOP` mode, disable the bar widget, and remove the installed files and hooks:
 ```bash
 ./uninstall.sh
+```
+
+Your `~/.config/omarchy/plugins/server-mode/config.toml` is **kept by default**. From an interactive terminal the uninstaller asks whether to delete it (default: keep); non-interactive runs always keep it, so a later `./install.sh` picks your settings back up. To remove everything, including the config, without a prompt:
+```bash
+./uninstall.sh --purge
 ```
 
 ### Optional: Headless SSH Polkit Rule

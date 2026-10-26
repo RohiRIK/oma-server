@@ -10,6 +10,27 @@ HOOK_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/hooks/post-boot.d/99-server
 SHELL_PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/rohirik.oma-server"
 CURRENT_UID="${UID:-$(id -u)}"
 RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
+CONFIG_FILE="$TARGET_DIR/config.toml"
+
+usage() {
+    cat <<'USAGE'
+Usage: ./uninstall.sh [--purge] [--help]
+
+  (default)   Remove oma-server but KEEP your config.toml. When run from an
+              interactive terminal you are asked first (default answer: keep).
+  --purge     Remove everything, including config.toml, without asking.
+  -h, --help  Show this help.
+USAGE
+}
+
+PURGE="false"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --purge) PURGE="true"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf "[ FAIL ] Unknown option '%s'.\n" "$1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 if [[ -f "$SCRIPT_DIR/lib/ui.sh" ]]; then
     # shellcheck source=/dev/null
@@ -18,6 +39,18 @@ else
     ui_log_info() { printf "[ INFO ] %s\n" "$1"; }
     ui_log_ok()   { printf "[ OK ] %s\n" "$1"; }
     ui_log_warn() { printf "[ WARN ] %s\n" "$1" >&2; }
+fi
+
+# Decide config.toml fate up front, before anything is removed.
+KEEP_CONFIG="true"
+if [[ "$PURGE" == "true" ]]; then
+    KEEP_CONFIG="false"
+elif [[ -f "$CONFIG_FILE" && -t 0 ]]; then
+    reply=""
+    read -r -p "Also delete your configuration ($CONFIG_FILE)? [y/N] " reply || reply=""
+    if [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        KEEP_CONFIG="false"
+    fi
 fi
 
 # 1. Restore HOST_LAPTOP profile if currently in HOMELAB_MODE
@@ -65,8 +98,14 @@ if [[ -f "$HOOK_FILE" ]]; then
 fi
 
 if [[ -d "$TARGET_DIR" ]]; then
-    ui_log_info "Removing runtime directory: $TARGET_DIR"
-    rm -rf "$TARGET_DIR"
+    if [[ "$KEEP_CONFIG" == "true" && -f "$CONFIG_FILE" ]]; then
+        ui_log_info "Removing runtime files from: $TARGET_DIR (keeping config.toml)"
+        find "$TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name config.toml -exec rm -rf {} +
+        ui_log_info "Configuration kept at: $CONFIG_FILE (run './uninstall.sh --purge' to remove it)"
+    else
+        ui_log_info "Removing runtime directory: $TARGET_DIR"
+        rm -rf "$TARGET_DIR"
+    fi
 fi
 
 if command -v omarchy-shell >/dev/null 2>&1; then

@@ -81,29 +81,86 @@ if [[ "$(realpath "$SHELL_PLUGIN_DIR")" != "$(realpath "$SCRIPT_DIR")" ]]; then
 fi
 
 # 7. Synchronize live Quickshell plugin cache & register widget
+#
+# Restarting the shell is only safe from inside the graphical session: over SSH
+# (no WAYLAND_DISPLAY / HYPRLAND_INSTANCE_SIGNATURE) omarchy-restart-shell kills
+# the running bar and the replacement cannot attach to the compositor, leaving
+# the desktop with no bar. Outside a graphical session we only ask the running
+# shell to rescan plugins over IPC and never kill it.
+has_graphical_session() {
+    [[ -n "${WAYLAND_DISPLAY:-}" && -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]
+}
+
 CURRENT_UID="${UID:-$(id -u)}"
-if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1; then
+widget_status="skipped"
+widget_detail=""
+
+if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT_UID" -x "omarchy-shell" >/dev/null 2>&1; then
     pkill -CONT -u "$CURRENT_UID" -x "quickshell" 2>/dev/null || true
+    pkill -CONT -u "$CURRENT_UID" -x "omarchy-shell" 2>/dev/null || true
     # Wait briefly for Quickshell's 150ms localPluginReloadTimer debounce to settle
     sleep 0.4
-    if command -v omarchy-restart-shell >/dev/null 2>&1; then
+
+    if has_graphical_session && command -v omarchy-restart-shell >/dev/null 2>&1; then
         ui_log_info "Reloading omarchy-shell QML type cache..."
         if ! omarchy-restart-shell >/dev/null 2>&1; then
             omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
             sleep 0.6
         fi
-    elif command -v omarchy-shell >/dev/null 2>&1; then
-        omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-        sleep 0.6
+    else
+        if ! has_graphical_session; then
+            ui_log_info "No graphical session detected (e.g. SSH); not restarting omarchy-shell, rescanning plugins instead."
+        fi
+        if command -v omarchy-shell >/dev/null 2>&1; then
+            omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+            sleep 0.6
+        fi
     fi
+
     if command -v omarchy >/dev/null 2>&1; then
-        OMARCHY_SHELL_IPC_TIMEOUT=5s omarchy plugin enable rohirik.oma-server --section right >/dev/null 2>&1 || true
-        sleep 0.4
+        enable_out=""
+        enable_rc=1
+        # The shell may still be starting after a restart; retry the IPC briefly.
+        for _attempt in 1 2 3; do
+            enable_rc=0
+            enable_out=$(OMARCHY_SHELL_IPC_TIMEOUT=5s omarchy plugin enable rohirik.oma-server --section right 2>&1) || enable_rc=$?
+            (( enable_rc == 0 )) && break
+            # Re-running the installer on an already-enabled widget is not a failure.
+            if [[ "$enable_out" == *"already"* ]]; then
+                enable_rc=0
+                break
+            fi
+            sleep 1
+        done
+        if (( enable_rc == 0 )); then
+            widget_status="enabled"
+        else
+            widget_status="failed"
+            widget_detail="$(printf '%s' "$enable_out" | head -n 1)"
+        fi
+    else
+        widget_detail="'omarchy' CLI not found"
     fi
+else
+    widget_detail="omarchy-shell / quickshell is not running for this user"
 fi
 
 echo ""
-ui_log_ok "oma-server installation complete."
+case "$widget_status" in
+    enabled)
+        ui_log_ok "oma-server installation complete (bar widget enabled)."
+        ;;
+    failed)
+        ui_log_fail "oma-server files installed, but enabling the bar widget FAILED (exit ${enable_rc}): ${widget_detail:-no output}" \
+            "From a terminal inside the desktop session run: omarchy plugin enable rohirik.oma-server --section right"
+        ui_log_info "Verify status dashboard : oma-server status"
+        exit 1
+        ;;
+    *)
+        ui_log_warn "oma-server files installed; bar widget NOT registered (${widget_detail})." \
+            "From a terminal inside the desktop session run: omarchy plugin enable rohirik.oma-server --section right"
+        ;;
+esac
 ui_log_info "Verify status dashboard : oma-server status"
 ui_log_info "Preview transition plan : oma-server diff"
 ui_log_info "Enable / place widget   : omarchy plugin enable rohirik.oma-server --section right"
