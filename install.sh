@@ -3,6 +3,11 @@
 # Enforces pre-flight validation, safe file permissions, and zero-emoji status badges.
 set -euo pipefail
 
+# omarchy-shell / omarchy-plugin-catalog need OMARCHY_PATH; it is only set inside
+# the graphical session, so default it for plain SSH / non-login shells.
+: "${OMARCHY_PATH:=/usr/share/omarchy}"
+export OMARCHY_PATH
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 TARGET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode"
 BIN_DIR="$HOME/.local/bin"
@@ -124,12 +129,9 @@ if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT
         for _attempt in 1 2 3; do
             enable_rc=0
             enable_out=$(OMARCHY_SHELL_IPC_TIMEOUT=5s omarchy plugin enable rohirik.oma-server --section right 2>&1) || enable_rc=$?
+            # omarchy-plugin-enable is idempotent: an already-enabled widget still
+            # returns exit 0 ("Enabled and moved <id>"), so exit status is the signal.
             (( enable_rc == 0 )) && break
-            # Re-running the installer on an already-enabled widget is not a failure.
-            if [[ "$enable_out" == *"already"* ]]; then
-                enable_rc=0
-                break
-            fi
             sleep 1
         done
         if (( enable_rc == 0 )); then

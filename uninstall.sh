@@ -3,13 +3,18 @@
 # Restores HOST_LAPTOP baseline before removing runtime artifacts, hooks, and bar widget.
 set -euo pipefail
 
+# omarchy-shell / omarchy-plugin-catalog need OMARCHY_PATH; it is only set inside
+# the graphical session, so default it for plain SSH / non-login shells.
+: "${OMARCHY_PATH:=/usr/share/omarchy}"
+export OMARCHY_PATH
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 TARGET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode"
 BIN_DIR="$HOME/.local/bin"
 HOOK_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/hooks/post-boot.d/99-server-profile-check.sh"
 SHELL_PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/rohirik.oma-server"
 CURRENT_UID="${UID:-$(id -u)}"
-RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
+RUN_DIR="${OMA_SERVER_RUN_DIR:-/run/user/${CURRENT_UID}/omarchy-server-mode}"
 CONFIG_FILE="$TARGET_DIR/config.toml"
 
 usage() {
@@ -53,8 +58,9 @@ elif [[ -f "$CONFIG_FILE" && -t 0 ]]; then
     fi
 fi
 
-# 1. Restore HOST_LAPTOP profile if currently in HOMELAB_MODE
-if [[ -d "$RUN_DIR" ]]; then
+# 1. Restore HOST_LAPTOP profile if currently in HOMELAB_MODE (an active snapshot
+#    exists); a bare or empty runtime dir is just removed silently.
+if [[ -f "$RUN_DIR/active-snapshot.json" ]]; then
     ui_log_info "Active runtime state detected at $RUN_DIR; restoring HOST_LAPTOP baseline..."
     if [[ -x "$TARGET_DIR/bin/omarchy-server-mode" ]]; then
         "$TARGET_DIR/bin/omarchy-server-mode" disable >/dev/null 2>&1 || \
@@ -63,6 +69,8 @@ if [[ -d "$RUN_DIR" ]]; then
         "$SCRIPT_DIR/bin/oma-server" disable >/dev/null 2>&1 || \
         "$SCRIPT_DIR/bin/oma-server" rescue >/dev/null 2>&1 || true
     fi
+    rm -rf "$RUN_DIR"
+elif [[ -d "$RUN_DIR" && ! -L "$RUN_DIR" ]]; then
     rm -rf "$RUN_DIR"
 fi
 
