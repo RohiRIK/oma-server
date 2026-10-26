@@ -112,7 +112,7 @@ start_inhibitor() {
     # Primary strategy: Spawn inside systemd --user manager cgroup (user@UID.service)
     # so Polkit maps the caller to the user's active graphical seat0 session even when
     # invoked over SSH, AND so SSH PTY hangup (SIGHUP) never terminates the inhibitor.
-    if command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1 || systemctl --user status >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1 && (systemctl --user is-system-running >/dev/null 2>&1 || systemctl --user status >/dev/null 2>&1); then
         systemctl --user stop oma-server-inhibitor.service >/dev/null 2>&1 || true
         systemctl --user reset-failed oma-server-inhibitor.service >/dev/null 2>&1 || true
         if systemd-run --user \
@@ -361,10 +361,16 @@ restore_compositor() {
         run_with_timeout 8 hyprctl eval "$restore_lua" >/dev/null 2>&1 || true
     fi
 
-    local reload_out=""
-    reload_out=$(run_with_timeout 8 hyprctl reload 2>&1 || true)
-    if [[ "$reload_out" == *"ok"* ]]; then
-        return 0
+    # Only a hard IPC failure (non-zero exit, e.g. timeout 124 or unreachable
+    # socket) is reported as a failed restore; reply wording varies across
+    # Hyprland versions, so it is not used as a failure signal.
+    local reload_out="" reload_rc=0
+    reload_out=$(run_with_timeout 8 hyprctl reload 2>&1) || reload_rc=$?
+    if (( reload_rc != 0 )); then
+        echo "" >&2
+        ui_log_fail "Hyprland config reload failed (exit ${reload_rc}): ${reload_out:-IPC timeout}" \
+            "Verify Hyprland IPC socket responsiveness, then re-run 'oma-server disable'."
+        return 1
     fi
     return 0
 }
@@ -626,24 +632,55 @@ restore_host_mode() {
     local is_auto_timeout="${3:-false}"
 
     local total_steps=5
+    local -a failed_steps=()
     echo ""
     ui_log_sync "Executing transactional restoration: HOMELAB_MODE -> HOST_LAPTOP"
 
-    ui_run_step 1 "$total_steps" "Resuming Quickshell event loop (SIGCONT)" \
-        resume_quickshell "$snapshot_file"
+    # Every step still runs (best-effort restore), but each failure is recorded
+    # so the caller can exit non-zero and the saved snapshot is kept for a retry.
+    if ! ui_run_step 1 "$total_steps" "Resuming Quickshell event loop (SIGCONT)" \
+        resume_quickshell "$snapshot_file"; then
+        failed_steps+=("Resuming Quickshell event loop (SIGCONT)")
+    fi
 
-    ui_run_step 2 "$total_steps" "Powering on display panels (DPMS on)" \
-        set_display_dpms "on" || true
+    if ! ui_run_step 2 "$total_steps" "Powering on display panels (DPMS on)" \
+        set_display_dpms "on"; then
+        failed_steps+=("Powering on display panels (DPMS on)")
+    fi
 
-    ui_run_step 3 "$total_steps" "Reloading Hyprland compositor configuration" \
-        restore_compositor "$snapshot_file"
+    if ! ui_run_step 3 "$total_steps" "Reloading Hyprland compositor configuration" \
+        restore_compositor "$snapshot_file"; then
+        failed_steps+=("Reloading Hyprland compositor configuration")
+    fi
 
     _release_guards() {
         stop_timeout_guard "$run_dir" "$is_auto_timeout"
         stop_inhibitor "$run_dir"
     }
-    ui_run_step 4 "$total_steps" "Releasing systemd-inhibit & timeout locks" \
-        _release_guards
+    if ! ui_run_step 4 "$total_steps" "Releasing systemd-inhibit & timeout locks" \
+        _release_guards; then
+        failed_steps+=("Releasing systemd-inhibit & timeout locks")
+    fi
+
+    if (( ${#failed_steps[@]} > 0 )); then
+        # Keep active-snapshot.json so 'disable' can be retried against the
+        # original captured state; only the released guard files are purged.
+        rm -f "$run_dir/inhibitor.pid" "$run_dir/inhibitor.err" "$run_dir/timeout.pid" "$run_dir/timeout.meta"
+        ui_log_warn "Step 5/${total_steps} skipped: active snapshot kept because restoration is incomplete."
+
+        echo "" >&2
+        ui_log_fail "Restoration incomplete: ${#failed_steps[@]} step(s) failed." \
+            "Saved state kept at ${snapshot_file}. Re-run 'oma-server disable', or 'oma-server rescue' to force a baseline."
+        local step_label
+        for step_label in "${failed_steps[@]}"; do
+            printf "         - %s\n" "$step_label" >&2
+        done
+
+        if command -v omarchy-shell >/dev/null 2>&1; then
+            run_with_timeout 2 omarchy-shell rohirik.oma-server refresh >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
 
     _cleanup_session_files() {
         rm -f "$snapshot_file"
@@ -687,7 +724,7 @@ force_rescue_mode() {
         _rescue_inhibitors
 
     ui_run_step 4 "$total_steps" "Re-synchronizing Hyprland configuration from disk" \
-        restore_compositor "$snapshot_file"
+        restore_compositor "$snapshot_file" || true
 
     _rescue_purge() {
         if [[ -d "$run_dir" && ! -L "$run_dir" && -O "$run_dir" ]]; then

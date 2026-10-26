@@ -55,6 +55,11 @@ if [[ "$1" == "eval" ]]; then
     exit 0
 fi
 if [[ "$1" == "dispatch" ]]; then
+    if [[ "${{OMA_TEST_FAIL_DPMS_ON:-0}}" == "1" ]] && [[ "$*" == *'action = "enable"'* || "$*" == *"dpms on"* ]]; then
+        # Simulate a hung Hyprland IPC socket (coreutils timeout exit code)
+        echo "error: IPC timeout" >&2
+        exit 124
+    fi
     if [[ "$*" == *'action = "disable"'* || "$*" == *"dpms off"* ]]; then
         echo "false" > "$STATE_DIR/dpms"
     elif [[ "$*" == *'action = "enable"'* || "$*" == *"dpms on"* ]]; then
@@ -64,6 +69,10 @@ if [[ "$1" == "dispatch" ]]; then
     exit 0
 fi
 if [[ "$1" == "reload" ]]; then
+    if [[ "${{OMA_TEST_FAIL_RELOAD:-0}}" == "1" ]]; then
+        echo "error: IPC timeout" >&2
+        exit 124
+    fi
     echo "ok"
     exit 0
 fi
@@ -182,7 +191,7 @@ exec /usr/bin/pkill "$@"
     def test_version_and_help_box(self):
         v = self.run_cli("--version")
         self.assertEqual(v.returncode, 0)
-        self.assertIn("oma-server v1.1.0", v.stdout)
+        self.assertIn("oma-server v1.1.1", v.stdout)
 
         h = self.run_cli("--help")
         self.assertEqual(h.returncode, 0)
@@ -262,6 +271,43 @@ exec /usr/bin/pkill "$@"
             (self.run_dir / "active-snapshot.json").exists(),
             "Rollback must remove active-snapshot.json when inhibitor fails",
         )
+
+    def test_disable_fails_and_keeps_state_when_dpms_restore_fails(self):
+        en = self.run_cli("enable", "-y")
+        self.assertEqual(en.returncode, 0, f"enable failed:\n{en.stdout}\n{en.stderr}")
+        snapshot = self.run_dir / "active-snapshot.json"
+        self.assertTrue(snapshot.is_file())
+
+        dis = self.run_cli("disable", extra_env={"OMA_TEST_FAIL_DPMS_ON": "1"})
+        out = ANSI_RE.sub("", dis.stdout + dis.stderr)
+        self.assertNotEqual(dis.returncode, 0, f"disable must fail when DPMS on fails:\n{out}")
+        self.assertIn("[ FAIL ] Powering on display panels", out)
+        self.assertIn("Restoration incomplete: 1 step(s) failed", out)
+        self.assertNotIn("Desktop restored to HOST_LAPTOP", out)
+        self.assertTrue(snapshot.is_file(), "Saved snapshot must be kept when a restore step fails")
+
+        # Once Hyprland answers again, a plain retry completes and purges state
+        retry = self.run_cli("disable")
+        self.assertEqual(retry.returncode, 0, f"retry failed:\n{retry.stdout}\n{retry.stderr}")
+        self.assertIn("Desktop restored to HOST_LAPTOP", ANSI_RE.sub("", retry.stdout))
+        self.assertFalse(snapshot.exists())
+
+    def test_disable_fails_and_keeps_state_when_reload_times_out(self):
+        en = self.run_cli("enable", "-y")
+        self.assertEqual(en.returncode, 0, f"enable failed:\n{en.stdout}\n{en.stderr}")
+        dis = self.run_cli("disable", extra_env={"OMA_TEST_FAIL_RELOAD": "1"})
+        out = ANSI_RE.sub("", dis.stdout + dis.stderr)
+        self.assertNotEqual(dis.returncode, 0, out)
+        self.assertIn("Reloading Hyprland compositor configuration", out)
+        self.assertNotIn("Desktop restored to HOST_LAPTOP", out)
+        self.assertTrue((self.run_dir / "active-snapshot.json").is_file())
+
+    def test_rescue_still_completes_when_reload_fails(self):
+        en = self.run_cli("enable", "-y")
+        self.assertEqual(en.returncode, 0, f"enable failed:\n{en.stdout}\n{en.stderr}")
+        res = self.run_cli("rescue", extra_env={"OMA_TEST_FAIL_RELOAD": "1"})
+        self.assertEqual(res.returncode, 0, f"rescue must stay best-effort:\n{res.stdout}\n{res.stderr}")
+        self.assertFalse(self.run_dir.exists())
 
     def test_rescue_restores_baseline(self):
         res = self.run_cli("rescue")

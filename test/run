@@ -22,6 +22,7 @@ run() {
 
 run "Manifest, packaging, and Panel.qml contract" python3 "$TEST_DIR/manifest.test.py"
 run "CLI, config, snapshot, and transition unit tests" python3 "$TEST_DIR/cli.test.py"
+run "install.sh / uninstall.sh sandboxed tests" python3 "$TEST_DIR/install.test.py"
 
 if [[ $failed -ne 0 ]]; then
   printf '\nSome tests failed.\n' >&2
