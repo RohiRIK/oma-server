@@ -204,7 +204,7 @@ oma-server deep-setup --remove   # removes the helper and the sudoers rule again
 ```
 `deep-setup` installs, following the same pattern as Omarchy's own `etc/sudoers.d` rules:
 - `/usr/local/lib/oma-server/deep-helper`: owned by root:root with mode 0755, in a root-owned directory. It only accepts a fixed set of verbs (`check`, `dm-stop`, `dm-start`, `dm-restart`, `inhibit-start`, `inhibit-stop`, `revert-arm <seconds>`, `revert-disarm`, `exit`). It takes no paths, no unit names and no shell input, and it pins `PATH`.
-- `/etc/sudoers.d/oma-server-deep`: mode 0440. It is checked with `visudo -cf` and then moved into place atomically. It contains a `%wheel NOPASSWD` grant that spells out each of those exact commands. Requires sudo 1.9.10 or newer.
+- `/etc/sudoers.d/oma-server-deep`: mode 0440. It is checked with `visudo -cf` and then moved into place atomically. It contains a `%wheel NOPASSWD` grant that spells out each of those exact commands. Requires sudo 1.9.10 or newer built with sudoers regex support. Arch/Omarchy has it; on builds without it (Ubuntu's, for example) `visudo -cf` fails and setup installs nothing.
 
 Because of that grant, any process running as a wheel user can stop and start the desktop without a password. That is a local denial of service, not a privilege escalation. The setup prompt says so before installing.
 
