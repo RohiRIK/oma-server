@@ -191,7 +191,7 @@ exec /usr/bin/pkill "$@"
     def test_version_and_help_box(self):
         v = self.run_cli("--version")
         self.assertEqual(v.returncode, 0)
-        self.assertIn("oma-server v1.1.1", v.stdout)
+        self.assertIn("oma-server v1.2.0", v.stdout)
 
         h = self.run_cli("--help")
         self.assertEqual(h.returncode, 0)

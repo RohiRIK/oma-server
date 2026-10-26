@@ -26,3 +26,12 @@ services = [
   "pipewire.service",
   "wireplumber.service"
 ]
+
+[deep]
+# Deep Server Mode (opt-in): stops Hyprland and the display manager, keeps SSH/docker/user services.
+# `oma-server deep-setup` flips `allowed` to true; `enable --deep` refuses while it is false.
+# There is deliberately no key to close apps or to force a timeout.
+allowed = false
+stop_display_manager = true
+exit_wait_seconds = 45             # how long `disable` waits for Hyprland to come back
+require_ssh = true                 # refuse unless sshd.service is active

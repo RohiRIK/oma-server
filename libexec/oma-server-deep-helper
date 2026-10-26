@@ -1,0 +1,113 @@
+#!/bin/bash
+# oma-server-deep-helper -- root-side helper for oma-server Deep Server Mode.
+#
+# Installed by `oma-server deep-setup` as /usr/local/lib/oma-server/deep-helper
+# (root:root 0755, root-owned directory) and granted to %wheel by
+# /etc/sudoers.d/oma-server-deep with exact arguments.
+#
+# Security contract (review before changing):
+#   * Fixed verb allowlist; anything else exits 2 before any privileged action.
+#   * Exactly one argument per verb, except `revert-arm <seconds>` (digits only,
+#     5..604920, revalidated here even though sudoers also pins the shape).
+#   * No user-controlled paths, unit names, environment, or shell evaluation.
+#   * PATH is pinned to system directories and only absolute binaries are run.
+#   * Touches only display-manager.service, oma-server-deep-inhibit.service and
+#     oma-server-deep-revert.timer/.service.
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+umask 022
+
+readonly HELPER_PATH="/usr/local/lib/oma-server/deep-helper"
+readonly SYSTEMCTL="/usr/bin/systemctl"
+readonly SYSTEMD_RUN="/usr/bin/systemd-run"
+readonly SYSTEMD_INHIBIT="/usr/bin/systemd-inhibit"
+readonly DM_UNIT="display-manager.service"
+readonly INHIBIT_UNIT="oma-server-deep-inhibit"
+readonly REVERT_UNIT="oma-server-deep-revert"
+
+die() {
+    printf 'deep-helper: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+usage_die() {
+    die "usage: deep-helper check|dm-stop|dm-start|dm-restart|inhibit-start|inhibit-stop|revert-arm <seconds>|revert-disarm|exit" 2
+}
+
+# ---- 1. Argument validation (runs before the root check so it is testable) ----
+(( $# >= 1 )) || usage_die
+verb="$1"
+seconds=""
+case "$verb" in
+    check|dm-stop|dm-start|dm-restart|inhibit-start|inhibit-stop|revert-disarm|exit)
+        (( $# == 1 )) || die "verb '$verb' takes no arguments" 2
+        ;;
+    revert-arm)
+        (( $# == 2 )) || die "revert-arm takes exactly one argument: <seconds>" 2
+        [[ "$2" =~ ^[1-9][0-9]{0,5}$ ]] || die "revert-arm: seconds must be digits only" 2
+        seconds=$(( 10#$2 ))
+        (( seconds >= 5 && seconds <= 604920 )) || die "revert-arm: seconds out of range (5..604920)" 2
+        ;;
+    *)
+        die "unknown verb" 2
+        ;;
+esac
+
+# ---- 2. Must be root (sudo/pkexec/root timer) ----
+[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "must run as root (via sudo)" 1
+
+inhibit_stop() {
+    "$SYSTEMCTL" stop "${INHIBIT_UNIT}.service" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" reset-failed "${INHIBIT_UNIT}.service" >/dev/null 2>&1 || true
+}
+
+revert_disarm() {
+    "$SYSTEMCTL" stop "${REVERT_UNIT}.timer" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" reset-failed "${REVERT_UNIT}.timer" "${REVERT_UNIT}.service" >/dev/null 2>&1 || true
+}
+
+dm_start() {
+    "$SYSTEMCTL" reset-failed "$DM_UNIT" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" start "$DM_UNIT"
+}
+
+case "$verb" in
+    check)
+        printf 'ok\n'
+        ;;
+    dm-stop)
+        "$SYSTEMCTL" stop "$DM_UNIT"
+        ;;
+    dm-start)
+        dm_start
+        ;;
+    dm-restart)
+        "$SYSTEMCTL" reset-failed "$DM_UNIT" >/dev/null 2>&1 || true
+        "$SYSTEMCTL" restart "$DM_UNIT"
+        ;;
+    inhibit-start)
+        inhibit_stop
+        "$SYSTEMD_RUN" --unit="$INHIBIT_UNIT" --collect --quiet \
+            "$SYSTEMD_INHIBIT" --what=sleep:idle:handle-lid-switch --who=oma-server \
+            --why="oma-server Deep Server Mode active" --mode=block /usr/bin/sleep infinity
+        ;;
+    inhibit-stop)
+        inhibit_stop
+        ;;
+    revert-arm)
+        revert_disarm
+        "$SYSTEMD_RUN" --unit="$REVERT_UNIT" --on-active="${seconds}s" --collect --quiet \
+            "$HELPER_PATH" exit
+        ;;
+    revert-disarm)
+        revert_disarm
+        ;;
+    exit)
+        # Root backup path (revert timer): bring the desktop back, release the lock.
+        # User-side cleanup (state file, linger) is finished by the post-boot hook.
+        dm_start || true
+        inhibit_stop
+        revert_disarm
+        ;;
+esac

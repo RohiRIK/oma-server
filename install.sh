@@ -32,6 +32,9 @@ for req_file in \
     "lib/config.sh" \
     "lib/snapshot.sh" \
     "lib/transition.sh" \
+    "lib/deep.sh" \
+    "libexec/oma-server-deep-helper" \
+    "templates/sudoers-oma-server-deep" \
     "config/config.toml" \
     "hooks/post-boot.d/99-server-profile-check.sh" \
     "manifest.json" \
@@ -43,14 +46,21 @@ for req_file in \
 done
 
 ui_log_info "Installing oma-server core runtime to: $TARGET_DIR"
-mkdir -p "$TARGET_DIR/bin" "$TARGET_DIR/lib" "$BIN_DIR" "$HOOK_DIR"
+mkdir -p "$TARGET_DIR/bin" "$TARGET_DIR/lib" "$TARGET_DIR/libexec" "$TARGET_DIR/templates" "$BIN_DIR" "$HOOK_DIR"
 
 # 2. Install modular libraries and CLI coordinator
 cp -f "$SCRIPT_DIR/lib/ui.sh" \
       "$SCRIPT_DIR/lib/config.sh" \
       "$SCRIPT_DIR/lib/snapshot.sh" \
       "$SCRIPT_DIR/lib/transition.sh" \
+      "$SCRIPT_DIR/lib/deep.sh" \
       "$TARGET_DIR/lib/"
+# Deep Server Mode sources (user dir only). Nothing root-owned is installed here:
+# the helper and sudoers rule are installed only by the opt-in `oma-server deep-setup`.
+cp -f "$SCRIPT_DIR/libexec/oma-server-deep-helper" "$TARGET_DIR/libexec/"
+cp -f "$SCRIPT_DIR/templates/sudoers-oma-server-deep" "$TARGET_DIR/templates/"
+chmod 0755 "$TARGET_DIR/libexec/oma-server-deep-helper"
+chmod 0644 "$TARGET_DIR/templates/sudoers-oma-server-deep"
 cp -f "$SCRIPT_DIR/bin/oma-server" "$TARGET_DIR/bin/omarchy-server-mode"
 cp -f "$SCRIPT_DIR/bin/oma-server" "$TARGET_DIR/bin/oma-server"
 chmod 0755 "$TARGET_DIR/bin/omarchy-server-mode" "$TARGET_DIR/bin/oma-server" "$TARGET_DIR/lib/"*.sh

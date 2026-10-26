@@ -101,6 +101,8 @@ omarchy plugin enable rohirik.oma-server --section right
 
 ### Uninstallation
 
+If Deep Server Mode is active, `uninstall.sh` refuses to run; run `oma-server disable` first. If the deep-mode helper and sudoers rule are installed, it removes them first, which needs a terminal for the sudo password.
+
 To cleanly restore `HOST_LAPTOP` mode, disable the bar widget, and remove the installed files and hooks:
 ```bash
 ./uninstall.sh
@@ -188,6 +190,46 @@ oma-server rescue
 Unconditionally unfreezes any stopped Quickshell instances, powers on all display outputs, terminates active inhibitor/timer units, reloads Hyprland configuration, and purges ephemeral lockfiles.
 
 ---
+
+## Deep Server Mode (opt-in)
+
+`HOMELAB_MODE` keeps your apps open and only pauses the desktop. **`DEEP_SERVER`** makes the machine behave like a headless Ubuntu server: no compositor, no bar, no GUI apps and no greeter. SSH, networking, docker/containers, agents and `systemd --user` services keep running. One command brings the full Omarchy desktop back through SDDM autologin.
+
+It is **off by default**. A normal `./install.sh` installs nothing root-owned and never turns it on.
+
+### One-time setup (needs a terminal and your sudo password)
+```bash
+oma-server deep-setup            # shows the files and the sudoers line, asks y/N
+oma-server deep-setup --remove   # removes the helper and the sudoers rule again
+```
+`deep-setup` installs, following the same pattern as Omarchy's own `etc/sudoers.d` rules:
+- `/usr/local/lib/oma-server/deep-helper`: owned by root:root with mode 0755, in a root-owned directory. It only accepts a fixed set of verbs (`check`, `dm-stop`, `dm-start`, `dm-restart`, `inhibit-start`, `inhibit-stop`, `revert-arm <seconds>`, `revert-disarm`, `exit`). It takes no paths, no unit names and no shell input, and it pins `PATH`.
+- `/etc/sudoers.d/oma-server-deep`: mode 0440. It is checked with `visudo -cf` and then moved into place atomically. It contains a `%wheel NOPASSWD` grant that spells out each of those exact commands. Requires sudo 1.9.10 or newer.
+
+Because of that grant, any process running as a wheel user can stop and start the desktop without a password. That is a local denial of service, not a privilege escalation. The setup prompt says so before installing.
+
+### Use
+```bash
+oma-server diff --deep                          # plan: windows that would close, units that stop
+oma-server enable --deep                        # refuses while any window is open
+oma-server enable --deep --close-apps           # lists the windows, then you must type: yes
+oma-server enable --deep --timeout 2h           # optional auto-revert (user timer + root backup timer)
+oma-server disable                              # from SSH or a TTY: brings the desktop back
+```
+- **Open windows:** the default is to refuse. To close them you need `--close-apps`, an interactive terminal, and the literal word `yes`. `-y` is rejected, and there is no config key that closes apps.
+- **Timer:** created only when you pass `--timeout`. Deep mode ignores `[profile] default_timeout`.
+- **Enter:** `uwsm stop`, then the display manager is stopped. Linger is enabled while in deep mode so user services survive, and a root sleep/lid inhibitor is held.
+- **Exit:** the display manager is started again and SDDM autologin brings Hyprland back. Then the inhibitor and timers are released and linger is restored.
+- **Not changed:** the default target (`graphical.target`), so a reboot always returns to the desktop.
+- **Terminal agents:** agents started from a GUI terminal die with the session. Run them as `systemd-run --user` units, or in tmux started that way.
+
+### Getting back without a bar
+1. Over SSH: `oma-server disable`.
+2. At the machine: Ctrl+Alt+F2, log in, then `oma-server disable`.
+3. Reboot or long-press power. Autologin brings the desktop back and the post-boot hook clears the deep-mode state.
+4. Panic command: `sudo systemctl start display-manager`.
+
+> **Lockout risk without `--timeout`:** if SSH becomes unreachable (Wi-Fi drops, the IP changes, sshd dies) and nobody is at the machine, the desktop stays down. With the lid closed, the inhibitor keeps the machine awake: heat and battery drain if it goes into a bag. `[deep] require_ssh = true` (the default) refuses to enter unless `sshd.service` is active.
 
 ## Configuration
 

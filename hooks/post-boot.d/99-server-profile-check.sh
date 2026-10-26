@@ -12,6 +12,29 @@ fi
 
 RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
 
+# --- Deep Server Mode -------------------------------------------------------
+# This hook fires ~2s after Hyprland starts, i.e. also in the middle of a deep
+# exit. While the exit runs (state DEEP_EXITING or deep.lock held) it owns all
+# cleanup, so do nothing at all. Otherwise (root backup timer, reboot, or a manual
+# login after DEEP_DEGRADED) let the CLI reconcile/finish the exit.
+DEEP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server"
+if [[ -f "$DEEP_DIR/deep.json" && ! -L "$DEEP_DIR/deep.json" ]]; then
+    deep_state=$(jq -r '.state // ""' "$DEEP_DIR/deep.json" 2>/dev/null || true)
+    if [[ "$deep_state" == "DEEP_EXITING" || "$deep_state" == "DEEP_ENTERING" ]]; then
+        exit 0
+    fi
+    if [[ -f "$DEEP_DIR/deep.lock" ]] && ! flock -n "$DEEP_DIR/deep.lock" true 2>/dev/null; then
+        exit 0
+    fi
+    oma_cli="$(command -v oma-server 2>/dev/null || true)"
+    [[ -z "$oma_cli" && -x "$HOME/.local/bin/oma-server" ]] && oma_cli="$HOME/.local/bin/oma-server"
+    if [[ -n "$oma_cli" ]]; then
+        # Reconciles a boot_id change (reboot) and finishes DEEP_SERVER/DEEP_DEGRADED exits.
+        "$oma_cli" __deep-post-boot >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+
 _verify_and_terminate_pid() {
     local pid_file="$1"
     local pattern="$2"

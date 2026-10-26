@@ -46,6 +46,32 @@ else
     ui_log_warn() { printf "[ WARN ] %s\n" "$1" >&2; }
 fi
 
+# 0. Deep Server Mode guard: never uninstall underneath an active deep session, and
+#    remove the opt-in root helper + sudoers rule before the CLI that removes them.
+DEEP_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server/deep.json"
+DEEP_ROOT_PREFIX="${OMA_SERVER_TEST_ROOT:-}"
+DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}/usr/local/lib/oma-server/deep-helper"
+DEEP_SUDOERS_PATH="${DEEP_ROOT_PREFIX}/etc/sudoers.d/oma-server-deep"
+if [[ -f "$DEEP_STATE_FILE" ]]; then
+    printf "[ FAIL ] Deep Server Mode is active (%s). Run 'oma-server disable' first; nothing was removed.\n" "$DEEP_STATE_FILE" >&2
+    exit 1
+fi
+if [[ -e "$DEEP_HELPER_PATH" || -e "$DEEP_SUDOERS_PATH" ]]; then
+    deep_cli=""
+    for cand in "$TARGET_DIR/bin/oma-server" "$SCRIPT_DIR/bin/oma-server"; do
+        [[ -x "$cand" ]] && { deep_cli="$cand"; break; }
+    done
+    if [[ ! -t 0 || -z "$deep_cli" ]]; then
+        printf "[ FAIL ] The Deep Server Mode root helper/sudoers rule is installed and removing it needs sudo in a terminal.\n" >&2
+        printf "         Run 'oma-server deep-setup --remove' (e.g. via 'ssh -t'), then re-run ./uninstall.sh. Nothing was removed.\n" >&2
+        exit 1
+    fi
+    if ! "$deep_cli" deep-setup --remove; then
+        printf "[ FAIL ] Could not remove the Deep Server Mode helper; nothing else was removed.\n" >&2
+        exit 1
+    fi
+fi
+
 # Decide config.toml fate up front, before anything is removed.
 KEEP_CONFIG="true"
 if [[ "$PURGE" == "true" ]]; then
