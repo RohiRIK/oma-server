@@ -259,6 +259,7 @@ exec /usr/bin/pkill "$@"
         dis = self.run_cli("disable", "--auto-timeout")
         self.assertEqual(dis.returncode, 0, f"disable --auto-timeout failed:\n{dis.stdout}\n{dis.stderr}")
         self.assertFalse((self.run_dir / "active-snapshot.json").exists())
+        self.assertFalse(self.run_dir.exists(), "Empty state dir must be removed after a clean disable")
 
         st_after = json.loads(self.run_cli("status", "--json").stdout)
         self.assertEqual(st_after["mode"], "HOST_LAPTOP")
@@ -271,6 +272,8 @@ exec /usr/bin/pkill "$@"
             (self.run_dir / "active-snapshot.json").exists(),
             "Rollback must remove active-snapshot.json when inhibitor fails",
         )
+        # systemd-inhibit's own error must survive into the failure message
+        self.assertIn("Interactive authentication required", ANSI_RE.sub("", res.stderr))
 
     def test_disable_fails_and_keeps_state_when_dpms_restore_fails(self):
         en = self.run_cli("enable", "-y")
@@ -283,6 +286,8 @@ exec /usr/bin/pkill "$@"
         self.assertNotEqual(dis.returncode, 0, f"disable must fail when DPMS on fails:\n{out}")
         self.assertIn("[ FAIL ] Powering on display panels", out)
         self.assertIn("Restoration incomplete: 1 step(s) failed", out)
+        # The final verdict must reach stderr (not be swallowed by the lock-FD close)
+        self.assertIn("Desktop restore FAILED", ANSI_RE.sub("", dis.stderr))
         self.assertNotIn("Desktop restored to HOST_LAPTOP", out)
         self.assertTrue(snapshot.is_file(), "Saved snapshot must be kept when a restore step fails")
 

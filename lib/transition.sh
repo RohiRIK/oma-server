@@ -135,7 +135,7 @@ start_inhibitor() {
         if command -v setsid >/dev/null 2>&1; then
             setsid -f bash -c "
                 trap '' HUP
-                exec 200>&- 2>/dev/null || true
+                { exec 200>&-; } 2>/dev/null || true
                 exec systemd-inhibit \
                     --no-ask-password \
                     --what=\"\$1\" \
@@ -147,7 +147,7 @@ start_inhibitor() {
         else
             (
                 trap '' HUP
-                exec 200>&- 2>/dev/null || true
+                { exec 200>&-; } 2>/dev/null || true
                 exec nohup systemd-inhibit \
                     --no-ask-password \
                     --what="$what" \
@@ -455,7 +455,7 @@ start_timeout_guard() {
             --property=KillMode=process \
             bash -c "
                 trap '' HUP
-                exec 200>&- 2>/dev/null || true
+                { exec 200>&-; } 2>/dev/null || true
                 sleep \"\$1\"
                 rm -f \"\$2/timeout.pid\" \"\$2/timeout.meta\"
                 if [[ -f \"\$2/active-snapshot.json\" ]]; then
@@ -473,7 +473,7 @@ start_timeout_guard() {
         if command -v setsid >/dev/null 2>&1; then
             setsid -f bash -c "
                 trap '' HUP
-                exec 200>&- 2>/dev/null || true
+                { exec 200>&-; } 2>/dev/null || true
                 echo \$\$ > \"\$2/timeout.pid\"
                 chmod 0600 \"\$2/timeout.pid\"
                 sleep \"\$1\"
@@ -489,7 +489,7 @@ start_timeout_guard() {
         else
             (
                 trap '' HUP
-                exec 200>&- 2>/dev/null || true
+                { exec 200>&-; } 2>/dev/null || true
                 sleep "$timeout_sec"
                 rm -f "$run_dir/timeout.pid" "$run_dir/timeout.meta"
                 if [[ -f "$run_dir/active-snapshot.json" ]]; then

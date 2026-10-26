@@ -54,12 +54,18 @@ exit 0
 echo "restart-shell" >> "{log}"
 exit 0
 """)
+        # Like the real tools, fail when OMARCHY_PATH is unset (plain SSH)
         write_executable(self.bin_dir / "omarchy-shell", f"""#!/usr/bin/env bash
-echo "omarchy-shell $*" >> "{log}"
+[[ -n "${{OMARCHY_PATH:-}}" ]] || {{ echo "omarchy-shell: OMARCHY_PATH is not set" >&2; exit 1; }}
+echo "omarchy-shell $* [OMARCHY_PATH=$OMARCHY_PATH]" >> "{log}"
 exit 0
 """)
         write_executable(self.bin_dir / "omarchy", f"""#!/usr/bin/env bash
-echo "omarchy $*" >> "{log}"
+if [[ -z "${{OMARCHY_PATH:-}}" ]]; then
+    echo "find: '/shell/plugins': No such file or directory" >&2
+    exit 1
+fi
+echo "omarchy $* [OMARCHY_PATH=$OMARCHY_PATH]" >> "{log}"
 if [[ "$1 $2" == "plugin enable" && "${{OMA_TEST_ENABLE_FAIL:-0}}" == "1" ]]; then
     echo "error: omarchy-shell IPC timed out" >&2
     exit 1
@@ -106,6 +112,19 @@ exit 0
         self.assertIn("omarchy plugin enable rohirik.oma-server", self.calls())
         self.assertIn("installation complete (bar widget enabled)", res.plain)
 
+    def test_install_defaults_omarchy_path_when_unset(self):
+        res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertNotIn("/shell/plugins", res.plain)
+        self.assertIn("omarchy plugin enable rohirik.oma-server --section right [OMARCHY_PATH=/usr/share/omarchy]", self.calls())
+
+    def test_install_respects_existing_omarchy_path(self):
+        res = self.run_script(
+            "install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1", "OMARCHY_PATH": "/opt/omarchy-dev"}
+        )
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("[OMARCHY_PATH=/opt/omarchy-dev]", self.calls())
+
     def test_install_in_graphical_session_restarts_shell(self):
         res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1"}, graphical=True)
         self.assertEqual(res.returncode, 0, res.plain)
@@ -151,6 +170,21 @@ exit 0
         res2 = self.run_script("install.sh")
         self.assertEqual(res2.returncode, 0, res2.plain)
         self.assertIn("# user edit", cfg.read_text(encoding="utf-8"))
+
+    def test_uninstall_disables_widget_with_default_omarchy_path(self):
+        self._install_with_custom_config()
+        res = self.run_script("uninstall.sh")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("omarchy plugin disable rohirik.oma-server [OMARCHY_PATH=/usr/share/omarchy]", self.calls())
+
+    def test_uninstall_ignores_empty_runtime_dir_in_laptop_mode(self):
+        self._install_with_custom_config()
+        run_dir = self.base / "runtime/omarchy-server-mode"
+        run_dir.mkdir(parents=True)
+        res = self.run_script("uninstall.sh", extra_env={"OMA_SERVER_RUN_DIR": str(run_dir)})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertNotIn("Active runtime state detected", res.plain)
+        self.assertFalse(run_dir.exists())
 
     def test_uninstall_purge_removes_config(self):
         self._install_with_custom_config()
