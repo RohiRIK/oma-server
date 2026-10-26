@@ -73,7 +73,7 @@ preflight_transition_check() {
         return 1
     fi
 
-    if ! run_with_timeout 3 hyprctl -j monitors >/dev/null 2>&1; then
+    if ! run_with_timeout 6 hyprctl -j monitors >/dev/null 2>&1; then
         ui_log_fail "Pre-flight check failed: Hyprland IPC socket is unreachable." \
             "Verify that Hyprland is active in the current desktop session."
         return 1
@@ -88,6 +88,7 @@ preflight_transition_check() {
 start_inhibitor() {
     local run_dir="$1"
     local config_file="$2"
+    local current_uid="${UID:-$(id -u)}"
 
     local raw_what raw_why what why
     raw_what="$(config_get_scalar "$config_file" "inhibit" "what" "sleep:idle:handle-lid-switch")"
@@ -98,33 +99,118 @@ start_inhibitor() {
     # Clean up any stale inhibitor before spawning
     stop_inhibitor "$run_dir"
 
-    # Spawn background inhibitor with closed lock FD (200) and detached stdio
-    (
-        exec 200>&- 2>/dev/null || true
-        exec systemd-inhibit \
-            --what="$what" \
-            --who="oma-server" \
-            --why="$why" \
-            --mode=block \
-            sleep infinity
-    ) </dev/null >/dev/null 2>&1 &
-    local in_pid=$!
+    local err_file="$run_dir/inhibitor.err"
+    rm -f "$err_file"
 
-    sleep 0.1
-    if verify_pid_identity "$in_pid" "systemd-inhibit|sleep"; then
+    # Engage Omarchy's native stay-awake indicator alongside systemd-inhibit
+    mkdir -p "${HOME}/.local/state/omarchy/indicators" 2>/dev/null || true
+    touch "${HOME}/.local/state/omarchy/indicators/stay-awake" 2>/dev/null || true
+
+    local in_pid=""
+    local used_systemd_run="false"
+
+    # Primary strategy: Spawn inside systemd --user manager cgroup (user@UID.service)
+    # so Polkit maps the caller to the user's active graphical seat0 session even when
+    # invoked over SSH, AND so SSH PTY hangup (SIGHUP) never terminates the inhibitor.
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1 || systemctl --user status >/dev/null 2>&1; then
+        systemctl --user stop oma-server-inhibitor.service >/dev/null 2>&1 || true
+        systemctl --user reset-failed oma-server-inhibitor.service >/dev/null 2>&1 || true
+        if systemd-run --user \
+            --unit=oma-server-inhibitor \
+            --collect \
+            --property=KillMode=control-group \
+            systemd-inhibit \
+                --no-ask-password \
+                --what="$what" \
+                --who="oma-server" \
+                --why="$why" \
+                --mode=block \
+                sleep infinity >/dev/null 2>"$err_file"; then
+            used_systemd_run="true"
+        fi
+    fi
+
+    # Fallback strategy: Detached setsid session with SIGHUP ignored
+    if [[ "$used_systemd_run" != "true" ]]; then
+        if command -v setsid >/dev/null 2>&1; then
+            setsid -f bash -c "
+                trap '' HUP
+                exec 200>&- 2>/dev/null || true
+                exec systemd-inhibit \
+                    --no-ask-password \
+                    --what=\"\$1\" \
+                    --who=\"oma-server\" \
+                    --why=\"\$2\" \
+                    --mode=block \
+                    sleep infinity
+            " _ "$what" "$why" </dev/null >/dev/null 2>"$err_file"
+        else
+            (
+                trap '' HUP
+                exec 200>&- 2>/dev/null || true
+                exec nohup systemd-inhibit \
+                    --no-ask-password \
+                    --what="$what" \
+                    --who="oma-server" \
+                    --why="$why" \
+                    --mode=block \
+                    sleep infinity
+            ) </dev/null >/dev/null 2>"$err_file" &
+            in_pid=$!
+        fi
+    fi
+
+    # Wait ~1.0s to ensure Polkit authorization completes and does not exit asynchronously
+    sleep 1.0
+
+    if [[ "$used_systemd_run" == "true" ]]; then
+        in_pid=$(systemctl --user show -p MainPID --value oma-server-inhibitor.service 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    if [[ -z "$in_pid" || "$in_pid" == "0" ]]; then
+        in_pid=$(pgrep -u "$current_uid" -f "systemd-inhibit.*--who=oma-server" 2>/dev/null | head -n 1 || true)
+    fi
+
+    # Verify both process liveness and registration in systemd-logind inhibitor table
+    local registered="false"
+    local check_iter
+    for check_iter in 1 2 3; do
+        if verify_pid_identity "$in_pid" "systemd-inhibit"; then
+            if run_with_timeout 3 systemd-inhibit --list 2>/dev/null | grep -q "oma-server"; then
+                registered="true"
+                break
+            fi
+        else
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [[ "$registered" == "true" ]] && verify_pid_identity "$in_pid" "systemd-inhibit"; then
         printf "%s\n" "$in_pid" > "$run_dir/inhibitor.pid"
         chmod 0600 "$run_dir/inhibitor.pid"
+        rm -f "$err_file"
         return 0
-    else
-        ui_log_fail "Failed to establish systemd-inhibit lock process." \
-            "Check 'systemctl status systemd-logind' and D-Bus user bus health."
-        return 1
     fi
+
+    local err_detail=""
+    if [[ -f "$err_file" && -s "$err_file" ]]; then
+        err_detail=$(head -n 1 "$err_file" | tr -d '\r\n' || true)
+    elif [[ "$used_systemd_run" == "true" ]]; then
+        err_detail=$(journalctl --user -u oma-server-inhibitor.service -n 3 --no-pager -o cat 2>/dev/null | tail -n 1 || true)
+    fi
+    rm -f "$err_file"
+    systemctl --user stop oma-server-inhibitor.service >/dev/null 2>&1 || true
+
+    echo "" >&2
+    ui_log_fail "Failed to establish systemd-inhibit lock (${err_detail:-Access denied by Polkit})." \
+        "Ensure an active desktop seat or add /etc/polkit-1/rules.d/49-oma-server-inhibit.rules (see README.md)."
+    return 1
 }
 
 stop_inhibitor() {
     local run_dir="$1"
     local pid_file="$run_dir/inhibitor.pid"
+    local current_uid="${UID:-$(id -u)}"
 
     if [[ -f "$pid_file" && ! -L "$pid_file" ]]; then
         local in_pid=""
@@ -134,6 +220,19 @@ stop_inhibitor() {
         fi
         rm -f "$pid_file"
     fi
+
+    systemctl --user stop oma-server-inhibitor.service >/dev/null 2>&1 || true
+    systemctl --user reset-failed oma-server-inhibitor.service >/dev/null 2>&1 || true
+
+    # Clean up any orphaned oma-server systemd-inhibit process owned by current user
+    local stray_pid=""
+    while IFS= read -r stray_pid; do
+        [[ -z "$stray_pid" ]] && continue
+        if verify_pid_identity "$stray_pid" "systemd-inhibit"; then
+            kill -TERM "$stray_pid" 2>/dev/null || true
+        fi
+    done < <(pgrep -u "$current_uid" -f "systemd-inhibit.*--who=oma-server" 2>/dev/null || true)
+
     return 0
 }
 
@@ -150,6 +249,12 @@ freeze_quickshell() {
     fi
 
     if [[ "$was_running" == "true" ]] && verify_pid_identity "$qs_pid" "quickshell|omarchy-shell"; then
+        # Notify the bar widget to display the Homelab icon (◆) and close any open popup
+        # before Quickshell's event loop is frozen with SIGSTOP.
+        if command -v omarchy-shell >/dev/null 2>&1; then
+            run_with_timeout 2 omarchy-shell rohirik.oma-server prepareHomelabFreeze >/dev/null 2>&1 || true
+            sleep 0.25
+        fi
         kill -STOP "$qs_pid" 2>/dev/null || true
     fi
     return 0
@@ -181,48 +286,131 @@ resume_quickshell() {
 }
 
 # -----------------------------------------------------------------------------
-# 5. Compositor Shader & FX Throttling
+# 5. Compositor Shader & FX Throttling (Hyprland 0.56 Lua eval + Legacy Fallback)
 # -----------------------------------------------------------------------------
 throttle_compositor() {
     local config_file="$1"
 
-    # Disable expensive rendering shaders and animations via batch IPC
-    run_with_timeout 3 hyprctl --batch \
-        "keyword animations:enabled 0 ; keyword decoration:blur:enabled false ; keyword decoration:shadow:enabled false ; keyword decoration:drop_shadow false ; keyword decoration:rounding 0 ; keyword misc:vfr 1" \
-        >/dev/null 2>&1 || {
-        # Fallback to individual calls if --batch is unsupported
-        run_with_timeout 2 hyprctl keyword animations:enabled 0 >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword decoration:blur:enabled false >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword decoration:shadow:enabled false >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword decoration:drop_shadow false >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword decoration:rounding 0 >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword misc:vfr 1 >/dev/null 2>&1 || true
-    }
-
     local auto_wake
     auto_wake="$(config_get_bool "$config_file" "profile" "auto_wake_on_input" "true")"
-    if [[ "$auto_wake" == "true" ]]; then
-        run_with_timeout 2 hyprctl keyword misc:mouse_move_enables_dpms true >/dev/null 2>&1 || true
-        run_with_timeout 2 hyprctl keyword misc:key_press_enables_dpms true >/dev/null 2>&1 || true
+    local wake_bool="true"
+    [[ "$auto_wake" == "false" ]] && wake_bool="false"
+
+    # Primary strategy: Hyprland 0.56+ Lua config engine (hyprctl eval 'hl.config(...)')
+    local lua_expr="hl.config({ animations = { enabled = false }, decoration = { rounding = 0, blur = { enabled = false }, shadow = { enabled = false } }, misc = { key_press_enables_dpms = ${wake_bool}, mouse_move_enables_dpms = ${wake_bool} } })"
+    local eval_out=""
+    local attempt
+    for attempt in 1 2; do
+        eval_out=$(run_with_timeout 8 hyprctl eval "$lua_expr" 2>&1 || true)
+        eval_out="${eval_out#"${eval_out%%[![:space:]]*}"}"
+        eval_out="${eval_out%"${eval_out##*[![:space:]]}"}"
+        if [[ "$eval_out" == "ok" ]]; then
+            return 0
+        fi
+        # If Lua eval is supported by Hyprland but IPC timed out, retry once
+        if [[ "$eval_out" != *"unknown"* && "$eval_out" != *"Invalid"* && "$eval_out" != *"legacy"* ]]; then
+            sleep 0.2
+            continue
+        fi
+        break
+    done
+
+    # Fallback strategy: Legacy Hyprland conf parser (hyprctl --batch keyword ...)
+    local batch_out=""
+    batch_out=$(run_with_timeout 8 hyprctl --batch \
+        "keyword animations:enabled 0 ; keyword decoration:blur:enabled false ; keyword decoration:shadow:enabled false ; keyword decoration:rounding 0 ; keyword misc:key_press_enables_dpms ${wake_bool} ; keyword misc:mouse_move_enables_dpms ${wake_bool}" \
+        2>&1 || true)
+    if [[ -n "$batch_out" && "$batch_out" != *"non-legacy"* && "$batch_out" != *"error"* && "$batch_out" == *"ok"* ]]; then
+        return 0
+    fi
+
+    echo "" >&2
+    ui_log_fail "Hyprland compositor throttle failed: ${eval_out:-${batch_out:-IPC timeout}}" \
+        "Verify Hyprland 0.56 Lua config or IPC socket responsiveness."
+    return 1
+}
+
+restore_compositor() {
+    local snapshot_file="${1:-}"
+
+    # Restore Omarchy stay-awake state if it was not active prior to Homelab Mode
+    local stay_awake_prev="false"
+    if [[ -n "$snapshot_file" && -f "$snapshot_file" ]]; then
+        stay_awake_prev=$(jq -r '.stay_awake_was_active // false' "$snapshot_file" 2>/dev/null || echo "false")
+    fi
+    if [[ "$stay_awake_prev" != "true" ]]; then
+        rm -f "${HOME}/.local/state/omarchy/indicators/stay-awake" 2>/dev/null || true
+    fi
+
+    # If snapshot contains captured compositor properties, restore them via Lua eval first
+    if [[ -n "$snapshot_file" && -f "$snapshot_file" ]]; then
+        local c_anim c_blur c_shadow c_round
+        c_anim=$(jq -r '.compositor_properties["animations:enabled"]' "$snapshot_file" 2>/dev/null || echo "true")
+        c_blur=$(jq -r '.compositor_properties["decoration:blur:enabled"]' "$snapshot_file" 2>/dev/null || echo "false")
+        c_shadow=$(jq -r '.compositor_properties["decoration:shadow:enabled"]' "$snapshot_file" 2>/dev/null || echo "false")
+        c_round=$(jq -r '.compositor_properties["decoration:rounding"]' "$snapshot_file" 2>/dev/null || echo "0")
+
+        [[ "$c_anim" == "1" ]] && c_anim="true"
+        [[ "$c_anim" == "0" ]] && c_anim="false"
+        [[ "$c_anim" == "true" || "$c_anim" == "false" ]] || c_anim="true"
+        [[ "$c_blur" == "true" || "$c_blur" == "false" ]] || c_blur="false"
+        [[ "$c_shadow" == "true" || "$c_shadow" == "false" ]] || c_shadow="false"
+        [[ "$c_round" =~ ^[0-9]+$ ]] || c_round="0"
+
+        local restore_lua="hl.config({ animations = { enabled = ${c_anim} }, decoration = { rounding = ${c_round}, blur = { enabled = ${c_blur} }, shadow = { enabled = ${c_shadow} } } })"
+        run_with_timeout 8 hyprctl eval "$restore_lua" >/dev/null 2>&1 || true
+    fi
+
+    local reload_out=""
+    reload_out=$(run_with_timeout 8 hyprctl reload 2>&1 || true)
+    if [[ "$reload_out" == *"ok"* ]]; then
+        return 0
     fi
     return 0
 }
 
-restore_compositor() {
-    run_with_timeout 4 hyprctl reload >/dev/null 2>&1 || true
-    return 0
-}
-
 # -----------------------------------------------------------------------------
-# 6. Display Power Management (DPMS)
+# 6. Display Power Management (DPMS via Hyprland 0.56 Lua + Legacy Fallback)
 # -----------------------------------------------------------------------------
 set_display_dpms() {
     local state="$1"
     if [[ "$state" != "on" && "$state" != "off" ]]; then
         return 1
     fi
-    run_with_timeout 3 hyprctl dispatch dpms "$state" >/dev/null 2>&1 || true
-    return 0
+
+    local lua_action="enable"
+    [[ "$state" == "off" ]] && lua_action="disable"
+
+    # Primary strategy: Hyprland 0.56+ Lua dispatcher (hl.dsp.dpms)
+    local out=""
+    local attempt
+    for attempt in 1 2; do
+        out=$(run_with_timeout 8 hyprctl dispatch "hl.dsp.dpms({ action = \"${lua_action}\" })" 2>&1 || true)
+        out="${out#"${out%%[![:space:]]*}"}"
+        out="${out%"${out##*[![:space:]]}"}"
+        if [[ "$out" == "ok" ]]; then
+            return 0
+        fi
+        if [[ "$out" != *"Invalid dispatcher"* && "$out" != *"unknown"* ]]; then
+            sleep 0.2
+            continue
+        fi
+        break
+    done
+
+    # Fallback strategy: Legacy Hyprland dispatcher (hyprctl dispatch dpms on/off)
+    local leg_out=""
+    leg_out=$(run_with_timeout 6 hyprctl dispatch dpms "$state" 2>&1 || true)
+    leg_out="${leg_out#"${leg_out%%[![:space:]]*}"}"
+    leg_out="${leg_out%"${leg_out##*[![:space:]]}"}"
+    if [[ "$leg_out" == "ok" ]]; then
+        return 0
+    fi
+
+    echo "" >&2
+    ui_log_fail "Hyprland DPMS '${state}' dispatch failed: ${out:-${leg_out:-IPC timeout}}" \
+        "Verify Hyprland display backend and Lua dispatcher availability."
+    return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -233,8 +421,9 @@ start_timeout_guard() {
     local timeout_sec="$2"
     local self_bin="$3"
     local timeout_label="${4:-${timeout_sec}s}"
+    local current_uid="${UID:-$(id -u)}"
 
-    stop_timeout_guard "$run_dir"
+    stop_timeout_guard "$run_dir" "false"
 
     if [[ -z "$timeout_sec" || "$timeout_sec" == "0" ]]; then
         return 0
@@ -245,15 +434,70 @@ start_timeout_guard() {
     fi
 
     local expire_epoch=$(( $(date +%s) + timeout_sec ))
+    local timer_pid=""
+    local used_systemd_run="false"
 
-    (
-        exec 200>&- 2>/dev/null || true
-        sleep "$timeout_sec"
-        if [[ -f "$run_dir/active-snapshot.json" ]]; then
-            "$self_bin" disable --auto-timeout >/dev/null 2>&1 || true
+    # Primary strategy: Detached systemd --user service unit so SSH logout (SIGHUP)
+    # never kills the countdown timer, and KillMode=process ensures the disable child
+    # is never terminated mid-flight.
+    if command -v systemd-run >/dev/null 2>&1 && (systemctl --user is-system-running >/dev/null 2>&1 || systemctl --user status >/dev/null 2>&1); then
+        systemctl --user stop oma-server-timer.service >/dev/null 2>&1 || true
+        systemctl --user reset-failed oma-server-timer.service >/dev/null 2>&1 || true
+        if systemd-run --user \
+            --unit=oma-server-timer \
+            --collect \
+            --property=KillMode=process \
+            bash -c "
+                trap '' HUP
+                exec 200>&- 2>/dev/null || true
+                sleep \"\$1\"
+                rm -f \"\$2/timeout.pid\" \"\$2/timeout.meta\"
+                if [[ -f \"\$2/active-snapshot.json\" ]]; then
+                    exec \"\$3\" disable --auto-timeout >/dev/null 2>&1
+                fi
+            " _ "$timeout_sec" "$run_dir" "$self_bin" >/dev/null 2>&1; then
+            used_systemd_run="true"
+            sleep 0.15
+            timer_pid=$(systemctl --user show -p MainPID --value oma-server-timer.service 2>/dev/null | tr -d '[:space:]' || true)
         fi
-    ) </dev/null >/dev/null 2>&1 &
-    local timer_pid=$!
+    fi
+
+    # Fallback strategy: setsid detached session with SIGHUP ignored
+    if [[ "$used_systemd_run" != "true" || -z "$timer_pid" || "$timer_pid" == "0" ]]; then
+        if command -v setsid >/dev/null 2>&1; then
+            setsid -f bash -c "
+                trap '' HUP
+                exec 200>&- 2>/dev/null || true
+                echo \$\$ > \"\$2/timeout.pid\"
+                chmod 0600 \"\$2/timeout.pid\"
+                sleep \"\$1\"
+                rm -f \"\$2/timeout.pid\" \"\$2/timeout.meta\"
+                if [[ -f \"\$2/active-snapshot.json\" ]]; then
+                    exec \"\$3\" disable --auto-timeout >/dev/null 2>&1
+                fi
+            " _ "$timeout_sec" "$run_dir" "$self_bin" </dev/null >/dev/null 2>&1
+            sleep 0.15
+            if [[ -f "$run_dir/timeout.pid" ]]; then
+                timer_pid=$(tr -d '[:space:]' < "$run_dir/timeout.pid" 2>/dev/null || true)
+            fi
+        else
+            (
+                trap '' HUP
+                exec 200>&- 2>/dev/null || true
+                sleep "$timeout_sec"
+                rm -f "$run_dir/timeout.pid" "$run_dir/timeout.meta"
+                if [[ -f "$run_dir/active-snapshot.json" ]]; then
+                    exec "$self_bin" disable --auto-timeout >/dev/null 2>&1
+                fi
+            ) </dev/null >/dev/null 2>&1 &
+            timer_pid=$!
+        fi
+    fi
+
+    if [[ -z "$timer_pid" || "$timer_pid" == "0" ]] || ! verify_pid_identity "$timer_pid" "oma-server|omarchy-server|bash|sleep"; then
+        ui_log_fail "Failed to arm Dead Man's Switch background timer."
+        return 1
+    fi
 
     printf "%s\n" "$timer_pid" > "$run_dir/timeout.pid"
     printf "%s|%s\n" "$timeout_label" "$expire_epoch" > "$run_dir/timeout.meta"
@@ -263,20 +507,32 @@ start_timeout_guard() {
 
 stop_timeout_guard() {
     local run_dir="$1"
+    local is_auto_timeout="${2:-false}"
     local timer_file="$run_dir/timeout.pid"
     local meta_file="$run_dir/timeout.meta"
+
+    # When invoked by the Dead Man's Switch itself (--auto-timeout), NEVER kill the
+    # caller process tree or stop oma-server-timer.service mid-restoration!
+    if [[ "$is_auto_timeout" == "true" ]]; then
+        rm -f "$timer_file" "$meta_file"
+        return 0
+    fi
 
     if [[ -f "$timer_file" && ! -L "$timer_file" ]]; then
         local timer_pid=""
         timer_pid=$(tr -d '[:space:]' < "$timer_file" 2>/dev/null || true)
-        if verify_pid_identity "$timer_pid" "oma-server|omarchy-server|bash|sleep"; then
-            # Terminate child sleep processes first, then the subshell
-            pkill -TERM -P "$timer_pid" 2>/dev/null || true
-            kill -TERM "$timer_pid" 2>/dev/null || true
+        if [[ -n "$timer_pid" && "$timer_pid" =~ ^[0-9]+$ ]] && (( timer_pid != $$ && timer_pid != PPID )); then
+            if verify_pid_identity "$timer_pid" "oma-server|omarchy-server|bash|sleep"; then
+                pkill -TERM -P "$timer_pid" 2>/dev/null || true
+                kill -TERM "$timer_pid" 2>/dev/null || true
+            fi
         fi
         rm -f "$timer_file"
     fi
     rm -f "$meta_file"
+
+    systemctl --user stop oma-server-timer.service >/dev/null 2>&1 || true
+    systemctl --user reset-failed oma-server-timer.service >/dev/null 2>&1 || true
     return 0
 }
 
@@ -290,11 +546,14 @@ rollback_homelab_transition() {
 
     ui_log_warn "Transition failed ($reason). Initiating automatic safety rollback..."
     resume_quickshell "$snapshot_file"
-    set_display_dpms "on"
-    restore_compositor
-    stop_timeout_guard "$run_dir"
+    set_display_dpms "on" || true
+    restore_compositor "$snapshot_file" || true
+    stop_timeout_guard "$run_dir" "false"
     stop_inhibitor "$run_dir"
     rm -f "$snapshot_file"
+    if command -v omarchy-shell >/dev/null 2>&1; then
+        run_with_timeout 2 omarchy-shell rohirik.oma-server refresh >/dev/null 2>&1 || true
+    fi
     ui_log_info "Rollback complete: Host desktop baseline restored safely."
 }
 
@@ -325,7 +584,7 @@ apply_homelab_mode() {
         return 1
     fi
 
-    if ! ui_run_step 3 "$total_steps" "Throttling Hyprland compositor shaders & VFR" \
+    if ! ui_run_step 3 "$total_steps" "Throttling Hyprland compositor shaders & FX" \
         throttle_compositor "$config_file"; then
         rollback_homelab_transition "$run_dir" "$snapshot_file" "Compositor throttle failed"
         return 1
@@ -345,7 +604,9 @@ apply_homelab_mode() {
     # only paused after every preceding guardrail is confirmed active.
     _finalize_dpms_and_freeze() {
         if [[ "$dpms_off" == "true" ]]; then
-            set_display_dpms "off"
+            if ! set_display_dpms "off"; then
+                return 1
+            fi
         fi
         freeze_quickshell "$snapshot_file"
     }
@@ -362,6 +623,7 @@ apply_homelab_mode() {
 restore_host_mode() {
     local run_dir="$1"
     local snapshot_file="$2"
+    local is_auto_timeout="${3:-false}"
 
     local total_steps=5
     echo ""
@@ -371,13 +633,13 @@ restore_host_mode() {
         resume_quickshell "$snapshot_file"
 
     ui_run_step 2 "$total_steps" "Powering on display panels (DPMS on)" \
-        set_display_dpms "on"
+        set_display_dpms "on" || true
 
     ui_run_step 3 "$total_steps" "Reloading Hyprland compositor configuration" \
-        restore_compositor
+        restore_compositor "$snapshot_file"
 
     _release_guards() {
-        stop_timeout_guard "$run_dir"
+        stop_timeout_guard "$run_dir" "$is_auto_timeout"
         stop_inhibitor "$run_dir"
     }
     ui_run_step 4 "$total_steps" "Releasing systemd-inhibit & timeout locks" \
@@ -385,10 +647,14 @@ restore_host_mode() {
 
     _cleanup_session_files() {
         rm -f "$snapshot_file"
-        rm -f "$run_dir/inhibitor.pid" "$run_dir/timeout.pid" "$run_dir/timeout.meta"
+        rm -f "$run_dir/inhibitor.pid" "$run_dir/inhibitor.err" "$run_dir/timeout.pid" "$run_dir/timeout.meta"
     }
     ui_run_step 5 "$total_steps" "Purging ephemeral runtime state artifacts" \
         _cleanup_session_files
+
+    if command -v omarchy-shell >/dev/null 2>&1; then
+        run_with_timeout 2 omarchy-shell rohirik.oma-server refresh >/dev/null 2>&1 || true
+    fi
 
     return 0
 }
@@ -411,17 +677,17 @@ force_rescue_mode() {
         _rescue_unfreeze
 
     ui_run_step 2 "$total_steps" "Forcing display outputs online (DPMS on)" \
-        set_display_dpms "on"
+        set_display_dpms "on" || true
 
     _rescue_inhibitors() {
-        stop_timeout_guard "$run_dir"
+        stop_timeout_guard "$run_dir" "false"
         stop_inhibitor "$run_dir"
     }
     ui_run_step 3 "$total_steps" "Terminating active inhibitor & timer processes" \
         _rescue_inhibitors
 
     ui_run_step 4 "$total_steps" "Re-synchronizing Hyprland configuration from disk" \
-        restore_compositor
+        restore_compositor "$snapshot_file"
 
     _rescue_purge() {
         if [[ -d "$run_dir" && ! -L "$run_dir" && -O "$run_dir" ]]; then
@@ -430,6 +696,10 @@ force_rescue_mode() {
     }
     ui_run_step 5 "$total_steps" "Purging runtime directory & stale lockfiles" \
         _rescue_purge
+
+    if command -v omarchy-shell >/dev/null 2>&1; then
+        run_with_timeout 2 omarchy-shell rohirik.oma-server refresh >/dev/null 2>&1 || true
+    fi
 
     return 0
 }

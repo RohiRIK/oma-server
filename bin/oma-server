@@ -37,7 +37,7 @@ done
 validate_runtime_environment
 
 CURRENT_UID="${UID:-$(id -u)}"
-RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
+RUN_DIR="${OMA_SERVER_RUN_DIR:-/run/user/${CURRENT_UID}/omarchy-server-mode}"
 SNAPSHOT_FILE="$RUN_DIR/active-snapshot.json"
 LOCK_FILE="$RUN_DIR/lock"
 
@@ -47,7 +47,7 @@ collect_status_telemetry() {
 
     local dpms_live="ON (Active)"
     local monitors_json=""
-    if monitors_json=$(run_with_timeout 2 hyprctl -j monitors 2>/dev/null) && [[ -n "$monitors_json" ]]; then
+    if monitors_json=$(run_with_timeout 5 hyprctl -j monitors 2>/dev/null) && [[ -n "$monitors_json" ]]; then
         local any_dpms
         any_dpms=$(printf "%s" "$monitors_json" | jq -r 'if (type == "array" and length > 0) then any(.[]; .dpmsStatus == true) else true end' 2>/dev/null || echo "true")
         if [[ "$any_dpms" == "false" ]]; then
@@ -88,10 +88,14 @@ collect_status_telemetry() {
             in_pid=$(tr -d '[:space:]' < "$RUN_DIR/inhibitor.pid" 2>/dev/null || true)
             if verify_pid_identity "$in_pid" "systemd-inhibit|sleep"; then
                 in_status="Active (PID: $in_pid)"
+            elif systemctl --user is-active --quiet oma-server-inhibitor.service 2>/dev/null; then
+                in_status="Active (systemd)"
             else
                 in_status="Stale"
                 health="DEGRADED"
             fi
+        elif systemctl --user is-active --quiet oma-server-inhibitor.service 2>/dev/null; then
+            in_status="Active (systemd)"
         else
             in_status="Inactive"
             health="DEGRADED"
@@ -227,25 +231,21 @@ collect_status_telemetry() {
 print_usage() {
     local w=76
     printf "\n%s┌%s┐%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
-    printf "%s│%s  %sOMA-SERVER v%s // PERFORMANCE & HOMELAB MODE ORCHESTRATOR%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_WHITE}" "$OMA_SERVER_VERSION" "${UI_RESET}" 16 "" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}${UI_WHITE}OMA-SERVER v${OMA_SERVER_VERSION} // PERFORMANCE & HOMELAB MODE ORCHESTRATOR${UI_RESET}"
     printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
-    printf "%s│%s  %sUSAGE:%s   %-65s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "${UI_RESET}" "$CMD_NAME <command> [options]" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}USAGE:${UI_RESET}   ${CMD_NAME} <command> [options]"
     printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
-    printf "%s│%s  %sCOMMANDS:%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_MUTED}" "${UI_RESET}" 65 "" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "status [--json]" "Display live telemetry panel or JSON payload" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "diff" "Render in-memory transition plan & Tier-0 audit" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "enable [options]" "Transition from HOST_LAPTOP to HOMELAB_MODE" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "disable" "Restore full desktop session & release locks" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "rescue" "Force emergency recovery to safe baseline" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}${UI_MUTED}COMMANDS:${UI_RESET}"
+    ui_box_line "$w" "$(printf "    %-24s %s" "status [--json]" "Display live telemetry panel or JSON payload")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "diff" "Render in-memory transition plan & Tier-0 audit")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "enable [options]" "Transition from HOST_LAPTOP to HOMELAB_MODE")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "disable" "Restore full desktop session & release locks")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "rescue" "Force emergency recovery to safe baseline")"
     printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
-    printf "%s│%s  %sENABLE OPTIONS:%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_MUTED}" "${UI_RESET}" 59 "" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "--dry-run" "Simulate transition in memory without changes" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "-y, --yes" "Skip interactive confirmation prompt" "${UI_CYAN}" "${UI_RESET}"
-    printf "%s│%s    %-26s %-45s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "--timeout <duration>" "Auto-revert Dead Man's Switch (e.g. 45m, 2h)" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}${UI_MUTED}ENABLE OPTIONS:${UI_RESET}"
+    ui_box_line "$w" "$(printf "    %-24s %s" "--dry-run" "Simulate transition in memory without changes")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "-y, --yes" "Skip interactive confirmation prompt")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "--timeout <duration>" "Auto-revert Dead Man's Switch (e.g. 45m, 2h)")"
     printf "%s└%s┘%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
 }
 
@@ -436,7 +436,7 @@ case "$cmd" in
             ui_log_warn "Dead Man's Switch timer expired. Auto-restoring HOST_LAPTOP profile..."
         fi
 
-        restore_host_mode "$RUN_DIR" "$SNAPSHOT_FILE"
+        restore_host_mode "$RUN_DIR" "$SNAPSHOT_FILE" "$is_auto_timeout"
 
         exec 200>&- 2>/dev/null || true
         rm -f "$LOCK_FILE"

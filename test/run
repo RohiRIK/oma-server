@@ -1,0 +1,31 @@
+#!/bin/bash
+#
+# Aggregated test runner for the rohirik.oma-server plugin.
+# Runs manifest, QML contract, and sandboxed CLI/backend unit tests,
+# continuing past failures so every test file gets runtime coverage.
+
+set -uo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_DIR="$ROOT/test"
+
+failed=0
+
+run() {
+  local label="$1"
+  shift
+  printf '==> %s\n' "$label"
+  if ! "$@"; then
+    failed=1
+  fi
+}
+
+run "Manifest, packaging, and Panel.qml contract" python3 "$TEST_DIR/manifest.test.py"
+run "CLI, config, snapshot, and transition unit tests" python3 "$TEST_DIR/cli.test.py"
+
+if [[ $failed -ne 0 ]]; then
+  printf '\nSome tests failed.\n' >&2
+  exit 1
+fi
+
+printf '\nAll tests passed.\n'

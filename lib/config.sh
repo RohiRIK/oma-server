@@ -35,11 +35,26 @@ validate_runtime_environment() {
         return 1
     fi
 
-    local base_run="/run/user/${current_uid}"
+    local base_run="${OMA_SERVER_RUNTIME_BASE:-/run/user/${current_uid}}"
     if [[ ! -d "$base_run" ]] || [[ -L "$base_run" ]] || [[ ! -O "$base_run" ]]; then
         ui_log_fail "Session runtime directory '$base_run' is missing, symlinked, or not owned by UID $current_uid." \
             "Ensure pam_systemd / systemd-logind user session is active."
         return 1
+    fi
+
+    export XDG_RUNTIME_DIR="$base_run"
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$base_run/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$base_run/bus"
+    fi
+
+    # Allow running from outside the graphical session (e.g. over SSH or systemd timer)
+    # by deriving HYPRLAND_INSTANCE_SIGNATURE from the newest instance runtime dir.
+    if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" && -d "$base_run/hypr" ]]; then
+        local hypr_dir=""
+        hypr_dir=$(find "$base_run/hypr" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2- || true)
+        if [[ -n "$hypr_dir" ]]; then
+            export HYPRLAND_INSTANCE_SIGNATURE="${hypr_dir##*/}"
+        fi
     fi
 
     return 0

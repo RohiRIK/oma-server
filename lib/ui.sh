@@ -4,6 +4,7 @@
 # Enforces a strict Zero-Emoji Policy using ANSI color hierarchies,
 # Unicode box-drawing borders, Braille spinners, and bracketed status badges.
 set -euo pipefail
+shopt -s extglob
 
 # -----------------------------------------------------------------------------
 # 1. Terminal Capability & ANSI Color Hierarchy Detection
@@ -155,7 +156,6 @@ ui_run_step() {
     bar_prefix="$(ui_render_bar_str "$step_idx" "$step_total" 10)"
 
     if [[ "$UI_IS_TTY" == true ]]; then
-        local frame_idx=0
         local spin_char="${UI_SPINNER_FRAMES[0]}"
         printf "\r\033[K  %s │ %s%s%s %s %s %s(0.0s)%s" \
             "$bar_prefix" "${UI_CYAN}" "$spin_char" "${UI_RESET}" \
@@ -191,7 +191,7 @@ ui_run_step() {
 }
 
 # -----------------------------------------------------------------------------
-# 4. Structured Box-Drawing Dashboard Panels
+# 4. Structured Box-Drawing Dashboard Panels (Exact Display-Width Aligned)
 # -----------------------------------------------------------------------------
 # Repeating horizontal rule helper
 ui_hr() {
@@ -201,6 +201,22 @@ ui_hr() {
     local i
     for (( i = 0; i < count; i++ )); do out+="$char"; done
     printf "%s" "$out"
+}
+
+# Prints a single bordered line padded to exact visible column width $1
+ui_box_line() {
+    local inner_w="$1"
+    local content="$2"
+    local plain="${content//$'\033'\[*([0-9;])m/}"
+    local vis_len="${#plain}"
+    local pad=$(( inner_w - vis_len ))
+    if (( pad < 0 )); then
+        # Safely truncate plain content if it ever exceeds inner_w
+        plain="${plain:0:$inner_w}"
+        content="$plain"
+        pad=0
+    fi
+    printf "%s│%s%s%*s%s│%s\n" "${UI_CYAN}" "${UI_RESET}" "$content" "$pad" "" "${UI_CYAN}" "${UI_RESET}"
 }
 
 ui_render_status_panel() {
@@ -224,12 +240,12 @@ ui_render_status_panel() {
     local mode_badge
     if [[ "$is_homelab" == "true" ]]; then
         if [[ "$health" == "DEGRADED" ]]; then
-            mode_badge="$(ui_badge_warn) HOMELAB_MODE (DEGRADED)"
+            mode_badge="$(ui_badge_warn) ${UI_YELLOW}HOMELAB_MODE (DEGRADED)${UI_RESET}"
         else
-            mode_badge="$(ui_badge_ok) HOMELAB_MODE (ACTIVE)"
+            mode_badge="$(ui_badge_ok) ${UI_GREEN}HOMELAB_MODE (ACTIVE)${UI_RESET}"
         fi
     else
-        mode_badge="$(ui_badge_info) HOST_LAPTOP (DEFAULT PROFILE)"
+        mode_badge="$(ui_badge_info) ${UI_WHITE}HOST_LAPTOP (DEFAULT PROFILE)${UI_RESET}"
     fi
 
     local in_badge
@@ -264,23 +280,33 @@ ui_render_status_panel() {
         tm_badge="$(ui_badge_idle)"
     fi
 
+    local k_prof k_since k_elap k_inh k_dpms k_qs k_tm k_t0 k_rt
+    printf -v k_prof  "%-22s" "OPERATIONAL PROFILE"
+    printf -v k_since "%-22s" "ACTIVE SINCE"
+    printf -v k_elap  "%-22s" "SESSION ELAPSED"
+    printf -v k_inh   "%-22s" "Power / Lid Inhibit"
+    printf -v k_dpms  "%-22s" "Display Output (DPMS)"
+    printf -v k_qs    "%-22s" "Quickshell Event Loop"
+    printf -v k_tm    "%-22s" "Dead-Man Timer Guard"
+    printf -v k_t0    "%-22s" "Tier-0 Protected Units"
+    printf -v k_rt    "%-22s" "Ephemeral Runtime Dir"
+
     printf "\n%s%s%s\n" "${UI_CYAN}" "$top_border" "${UI_RESET}"
-    printf "%s│%s  %sOMA-SERVER // SYSTEM TELEMETRY & GUARDRAIL DASHBOARD%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_WHITE}" "${UI_RESET}" 22 "" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}${UI_WHITE}OMA-SERVER // SYSTEM TELEMETRY & GUARDRAIL DASHBOARD${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$mid_border" "${UI_RESET}"
 
-    printf "%s│%s  %-22s : %s\n" "${UI_CYAN}" "${UI_RESET}" "OPERATIONAL PROFILE" "$mode_badge"
-    printf "%s│%s  %-22s : %s%s%s\n" "${UI_CYAN}" "${UI_RESET}" "ACTIVE SINCE" "${UI_WHITE}" "${since_str:-N/A (Host Mode)}" "${UI_RESET}"
-    printf "%s│%s  %-22s : %s%s%s\n" "${UI_CYAN}" "${UI_RESET}" "SESSION ELAPSED" "${UI_CYAN}" "${elapsed_human:-00h 00m 00s}" "${UI_RESET}"
+    ui_box_line "$w" "  ${k_prof} : ${mode_badge}"
+    ui_box_line "$w" "  ${k_since} : ${UI_WHITE}${since_str:-N/A (Host Mode)}${UI_RESET}"
+    ui_box_line "$w" "  ${k_elap} : ${UI_CYAN}${elapsed_human:-00h 00m 00s}${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$mid_border" "${UI_RESET}"
 
-    printf "%s│%s  %sSUBSYSTEM GUARDRAILS%s\n" "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_MUTED}" "${UI_RESET}"
-    printf "%s│%s  %-22s : %s %s\n" "${UI_CYAN}" "${UI_RESET}" "Power / Lid Inhibit" "$in_badge" "$in_status"
-    printf "%s│%s  %-22s : %s %s\n" "${UI_CYAN}" "${UI_RESET}" "Display Output (DPMS)" "$dpms_badge" "$dpms_status"
-    printf "%s│%s  %-22s : %s %s\n" "${UI_CYAN}" "${UI_RESET}" "Quickshell Event Loop" "$qs_badge" "$qs_status"
-    printf "%s│%s  %-22s : %s %s\n" "${UI_CYAN}" "${UI_RESET}" "Dead-Man Timer Guard" "$tm_badge" "$timeout_status"
-    printf "%s│%s  %-22s : %s %s\n" "${UI_CYAN}" "${UI_RESET}" "Tier-0 Protected Units" "$(ui_badge_protect)" "$protected_summary"
-    printf "%s│%s  %-22s : %s%s%s\n" "${UI_CYAN}" "${UI_RESET}" "Ephemeral Runtime Dir" "${UI_MUTED}" "${runtime_dir:-None (Clean)}" "${UI_RESET}"
+    ui_box_line "$w" "  ${UI_BOLD}${UI_MUTED}SUBSYSTEM GUARDRAILS${UI_RESET}"
+    ui_box_line "$w" "  ${k_inh} : ${in_badge} ${in_status}"
+    ui_box_line "$w" "  ${k_dpms} : ${dpms_badge} ${dpms_status}"
+    ui_box_line "$w" "  ${k_qs} : ${qs_badge} ${qs_status}"
+    ui_box_line "$w" "  ${k_tm} : ${tm_badge} ${timeout_status}"
+    ui_box_line "$w" "  ${k_t0} : $(ui_badge_protect) ${protected_summary}"
+    ui_box_line "$w" "  ${k_rt} : ${UI_MUTED}${runtime_dir:-None (Clean)}${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$bot_border" "${UI_RESET}"
 }
 
@@ -290,17 +316,17 @@ ui_render_diff_panel() {
     shift 2
     local -a services=("$@")
 
-    local cur_anim cur_blur cur_shadow cur_vfr cur_dpms
-    cur_anim=$(echo "$snapshot_json" | jq -r '.compositor_properties["animations:enabled"]')
-    cur_blur=$(echo "$snapshot_json" | jq -r '.compositor_properties["decoration:blur:enabled"]')
-    cur_shadow=$(echo "$snapshot_json" | jq -r '.compositor_properties["decoration:drop_shadow"]')
-    cur_vfr=$(echo "$snapshot_json" | jq -r '.compositor_properties["misc:vfr"]')
-    cur_dpms=$(echo "$snapshot_json" | jq -r '.compositor_properties.dpms_status')
+    local cur_anim cur_blur cur_shadow cur_rounding cur_dpms
+    cur_anim=$(printf "%s" "$snapshot_json" | jq -r 'if (.compositor_properties | has("animations:enabled")) then (.compositor_properties["animations:enabled"] | tostring) else "unavailable" end' 2>/dev/null || echo "unavailable")
+    cur_blur=$(printf "%s" "$snapshot_json" | jq -r 'if (.compositor_properties | has("decoration:blur:enabled")) then (.compositor_properties["decoration:blur:enabled"] | tostring) else "unavailable" end' 2>/dev/null || echo "unavailable")
+    cur_shadow=$(printf "%s" "$snapshot_json" | jq -r 'if (.compositor_properties | has("decoration:shadow:enabled")) then (.compositor_properties["decoration:shadow:enabled"] | tostring) else "unavailable" end' 2>/dev/null || echo "unavailable")
+    cur_rounding=$(printf "%s" "$snapshot_json" | jq -r 'if (.compositor_properties | has("decoration:rounding")) then (.compositor_properties["decoration:rounding"] | tostring) else "unavailable" end' 2>/dev/null || echo "unavailable")
+    cur_dpms=$(printf "%s" "$snapshot_json" | jq -r 'if (.compositor_properties | has("dpms_status")) then (.compositor_properties.dpms_status | tostring) else "unavailable" end' 2>/dev/null || echo "unavailable")
 
     local qs_pid qs_running qs_action
-    qs_pid=$(echo "$snapshot_json" | jq -r '.quickshell_state.pid')
-    qs_running=$(echo "$snapshot_json" | jq -r '.quickshell_state.was_running')
-    qs_action=$(echo "$snapshot_json" | jq -r '.quickshell_state.action_taken')
+    qs_pid=$(printf "%s" "$snapshot_json" | jq -r '.quickshell_state.pid // "null"' 2>/dev/null || echo "null")
+    qs_running=$(printf "%s" "$snapshot_json" | jq -r '.quickshell_state.was_running // false' 2>/dev/null || echo "false")
+    qs_action=$(printf "%s" "$snapshot_json" | jq -r '.quickshell_state.action_taken // "SIGSTOP"' 2>/dev/null || echo "SIGSTOP")
 
     local qs_desc="Inactive"
     if [[ "$qs_running" == "true" ]]; then
@@ -310,82 +336,97 @@ ui_render_diff_panel() {
     local dpms_desc="OFF"
     if [[ "$cur_dpms" == "true" ]]; then
         dpms_desc="ON (Active)"
+    elif [[ "$cur_dpms" != "false" ]]; then
+        dpms_desc="unavailable"
     fi
 
-    local timeout_desc="Disabled (Manual Restore)"
+    local timeout_desc="Disabled (Manual)"
     if [[ -n "$timeout_val" && "$timeout_val" != "0" ]]; then
         timeout_desc="$timeout_val (Auto-Revert)"
     fi
 
-    local c1=28 c2=22 c3=26
-    local top="┌$(ui_hr "$c1")┬$(ui_hr "$c2")┬$(ui_hr "$c3")┐"
-    local sep="├$(ui_hr "$c1")┼$(ui_hr "$c2")┼$(ui_hr "$c3")┤"
-    local bot="└$(ui_hr "$c1")┴$(ui_hr "$c2")┴$(ui_hr "$c3")┘"
-    local full_w=$(( c1 + c2 + c3 + 2 ))
+    # 3 columns: 28 + 1 + 22 + 1 + 24 = 76 inner width
+    local c1=28 c2=22 c3=24
+    local full_w=76
     local banner_top="┌$(ui_hr "$full_w")┐"
     local banner_mid="├$(ui_hr "$c1")┬$(ui_hr "$c2")┬$(ui_hr "$c3")┤"
+    local sep="├$(ui_hr "$c1")┼$(ui_hr "$c2")┼$(ui_hr "$c3")┤"
+    local bot="└$(ui_hr "$c1")┴$(ui_hr "$c2")┴$(ui_hr "$c3")┘"
 
     printf "\n%s%s%s\n" "${UI_CYAN}" "$banner_top" "${UI_RESET}"
-    printf "%s│%s  %sOMA-SERVER // TRANSITION PLANNER (HOST_LAPTOP -> HOMELAB_MODE)%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_WHITE}" "${UI_RESET}" 14 "" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$full_w" "  ${UI_BOLD}${UI_WHITE}OMA-SERVER // TRANSITION PLANNER (HOST_LAPTOP -> HOMELAB_MODE)${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$banner_mid" "${UI_RESET}"
-    printf "%s│%s %s%-26s%s %s│%s %s%-20s%s %s│%s %s%-24s%s %s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "SUBSYSTEM / PROPERTY" "${UI_RESET}" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "CURRENT HOST STATE" "${UI_RESET}" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "TARGET HOMELAB STATE" "${UI_RESET}" \
+
+    local h1 h2 h3
+    printf -v h1 "%-26s" "SUBSYSTEM / PROPERTY"
+    printf -v h2 "%-20s" "CURRENT HOST STATE"
+    printf -v h3 "%-22s" "TARGET HOMELAB STATE"
+    printf "%s│%s %s%s%s %s│%s %s%s%s %s│%s %s%s%s %s│%s\n" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "$h1" "${UI_RESET}" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "$h2" "${UI_RESET}" \
+        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}" "$h3" "${UI_RESET}" \
         "${UI_CYAN}" "${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$sep" "${UI_RESET}"
 
     local -a rows=(
-        "animations:enabled|${cur_anim}|0 (Disabled)"
+        "animations:enabled|${cur_anim}|false (Disabled)"
         "decoration:blur:enabled|${cur_blur}|false (Disabled)"
-        "decoration:drop_shadow|${cur_shadow}|false (Disabled)"
-        "misc:vfr|${cur_vfr}|1 (Enforced VFR)"
+        "decoration:shadow:enabled|${cur_shadow}|false (Disabled)"
+        "decoration:rounding|${cur_rounding}|0 (No Rounding)"
         "display:dpms|${dpms_desc}|OFF (Panel Powerdown)"
         "omarchy-shell (Quickshell)|${qs_desc}|${qs_action} (0% CPU Pause)"
-        "systemd-logind inhibitor|Inactive|Active (Sleep/Lid Lock)"
+        "systemd-logind inhibitor|Inactive|Active (Sleep/Lid)"
         "dead-man switch timer|None|${timeout_desc}"
     )
 
-    local row prop cur target
+    local row prop cur target f_prop f_cur f_target
     for row in "${rows[@]}"; do
         IFS='|' read -r prop cur target <<< "$row"
-        printf "%s│%s %-26s %s│%s %s%-20s%s %s│%s %s%-24s%s %s│%s\n" \
-            "${UI_CYAN}" "${UI_RESET}" "$prop" \
-            "${UI_CYAN}" "${UI_RESET}" "${UI_MUTED}" "${cur:0:20}" "${UI_RESET}" \
-            "${UI_CYAN}" "${UI_RESET}" "${UI_GREEN}" "${target:0:24}" "${UI_RESET}" \
+        printf -v f_prop   "%-26s" "${prop:0:26}"
+        printf -v f_cur    "%-20s" "${cur:0:20}"
+        printf -v f_target "%-22s" "${target:0:22}"
+        printf "%s│%s %s %s│%s %s%s%s %s│%s %s%s%s %s│%s\n" \
+            "${UI_CYAN}" "${UI_RESET}" "$f_prop" \
+            "${UI_CYAN}" "${UI_RESET}" "${UI_MUTED}" "$f_cur" "${UI_RESET}" \
+            "${UI_CYAN}" "${UI_RESET}" "${UI_GREEN}" "$f_target" "${UI_RESET}" \
             "${UI_CYAN}" "${UI_RESET}"
     done
     printf "%s%s%s\n" "${UI_CYAN}" "$bot" "${UI_RESET}"
 
-    # Tier-0 Protected Services Box
+    # Tier-0 Protected Services Box (2 columns: 42 + 1 + 33 = 76 inner width)
+    local s1=42 s2=33
     local svc_top="┌$(ui_hr "$full_w")┐"
-    local svc_sep="├$(ui_hr "$full_w")┤"
-    local svc_bot="└$(ui_hr "$full_w")┘"
+    local svc_sep="├$(ui_hr "$s1")┬$(ui_hr "$s2")┤"
+    local svc_bot="└$(ui_hr "$s1")┴$(ui_hr "$s2")┘"
     printf "\n%s%s%s\n" "${UI_CYAN}" "$svc_top" "${UI_RESET}"
-    printf "%s│%s  %sTIER-0 PROTECTED HOMELAB SERVICES AUDIT (GUARANTEED UNTOUCHED)%s%*s%s│%s\n" \
-        "${UI_CYAN}" "${UI_RESET}" "${UI_BOLD}${UI_WHITE}" "${UI_RESET}" 14 "" "${UI_CYAN}" "${UI_RESET}"
+    ui_box_line "$full_w" "  ${UI_BOLD}${UI_WHITE}TIER-0 PROTECTED HOMELAB SERVICES AUDIT (GUARANTEED UNTOUCHED)${UI_RESET}"
     printf "%s%s%s\n" "${UI_CYAN}" "$svc_sep" "${UI_RESET}"
 
-    local svc status
+    local svc status f_svc f_status
     for svc in "${services[@]}"; do
         [[ -z "$svc" ]] && continue
-        status="inactive"
+        status="inactive (no action)"
+        local is_act="false"
         if run_with_timeout 2 systemctl is-active --quiet "$svc" 2>/dev/null; then
             status="active (system)"
+            is_act="true"
         elif run_with_timeout 2 systemctl --user is-active --quiet "$svc" 2>/dev/null; then
             status="active (user)"
+            is_act="true"
         fi
 
-        if [[ "$status" != "inactive" ]]; then
-            printf "%s│%s  %s %-28s %s│%s %-32s %s│%s\n" \
-                "${UI_CYAN}" "${UI_RESET}" "$(ui_badge_protect)" "$svc" \
-                "${UI_MUTED}" "${UI_RESET}" "${UI_GREEN}${status}${UI_RESET}" \
+        printf -v f_svc    "%-27s" "${svc:0:27}"
+        printf -v f_status "%-31s" "${status:0:31}"
+
+        if [[ "$is_act" == "true" ]]; then
+            printf "%s│%s  %s %s %s│%s %s%s%s %s│%s\n" \
+                "${UI_CYAN}" "${UI_RESET}" "$(ui_badge_protect)" "$f_svc" \
+                "${UI_CYAN}" "${UI_RESET}" "${UI_GREEN}" "$f_status" "${UI_RESET}" \
                 "${UI_CYAN}" "${UI_RESET}"
         else
-            printf "%s│%s  %s %-28s %s│%s %-32s %s│%s\n" \
-                "${UI_CYAN}" "${UI_RESET}" "$(ui_badge_idle)" "$svc" \
-                "${UI_MUTED}" "${UI_RESET}" "${UI_MUTED}inactive (no action)${UI_RESET}" \
+            printf "%s│%s  %s %s %s│%s %s%s%s %s│%s\n" \
+                "${UI_CYAN}" "${UI_RESET}" "$(ui_badge_idle)" "$f_svc" \
+                "${UI_CYAN}" "${UI_RESET}" "${UI_MUTED}" "$f_status" "${UI_RESET}" \
                 "${UI_CYAN}" "${UI_RESET}"
         fi
     done

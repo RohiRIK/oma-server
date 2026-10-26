@@ -3,15 +3,14 @@
 # Hardened snapshot extraction, atomic persistence, and schema validation for oma-server.
 set -euo pipefail
 
-# Helper: Safely extract an option JSON object from hyprctl with timeout and JSON fallback
+# Helper: Safely extract an option JSON object from hyprctl with generous timeout for TCG/emulation
 _query_hypr_option_json() {
     local opt_name="$1"
-    local default_json="${2:-{\"int\":1}}"
     local raw=""
 
-    raw=$(run_with_timeout 3 hyprctl -j getoption "$opt_name" 2>/dev/null || true)
-    if [[ -z "$raw" ]] || [[ "$raw" =~ "no such option" ]] || ! printf "%s" "$raw" | jq empty 2>/dev/null; then
-        printf "%s" "$default_json"
+    raw=$(run_with_timeout 6 hyprctl -j getoption "$opt_name" 2>/dev/null || true)
+    if [[ -z "$raw" ]] || [[ "$raw" == *"no such option"* ]] || ! printf "%s" "$raw" | jq empty 2>/dev/null; then
+        printf "{}"
         return 1
     fi
 
@@ -19,50 +18,97 @@ _query_hypr_option_json() {
     return 0
 }
 
-# Captures runtime state from Hyprland and Quickshell, returning a canonical JSON document
+# Captures runtime state from Hyprland and Quickshell, returning a canonical JSON document.
+# Uses a single batched IPC call first so even slow emulated environments complete in ~1.5s.
 capture_snapshot() {
     local qs_strategy="${1:-sigstop}"
     local current_uid="${UID:-$(id -u)}"
 
-    # Pre-flight: Verify that the Hyprland IPC socket is responsive within timeout
-    local monitors_raw=""
-    if ! monitors_raw=$(run_with_timeout 3 hyprctl -j monitors 2>/dev/null) || [[ -z "$monitors_raw" ]] || ! printf "%s" "$monitors_raw" | jq empty 2>/dev/null; then
-        if declare -F ui_log_fail >/dev/null 2>&1; then
-            ui_log_fail "Unable to communicate with Hyprland via hyprctl IPC within 3s timeout." \
-                "Ensure Hyprland is running and HYPRLAND_INSTANCE_SIGNATURE is set in this session."
-        else
-            echo "[ FAIL ] Unable to communicate with Hyprland via hyprctl IPC." >&2
+    local batch_raw=""
+    local parsed_batch=""
+    local attempt
+    for attempt in 1 2; do
+        batch_raw=$(run_with_timeout 8 hyprctl -j --batch \
+            "getoption animations:enabled ; getoption decoration:blur:enabled ; getoption decoration:shadow:enabled ; getoption decoration:rounding ; monitors" \
+            2>/dev/null || true)
+        if [[ -n "$batch_raw" ]]; then
+            parsed_batch=$(printf "%s" "$batch_raw" | jq -cs 'if length == 5 and (.[4] | type == "array") then . else empty end' 2>/dev/null || true)
+            if [[ -n "$parsed_batch" ]]; then
+                break
+            fi
         fi
-        return 1
+        sleep 0.2
+    done
+
+    local anim_raw="{}" blur_raw="{}" shadow_raw="{}" rounding_raw="{}" monitors_raw=""
+    if [[ -n "$parsed_batch" ]]; then
+        anim_raw=$(printf "%s" "$parsed_batch" | jq -c '.[0]')
+        blur_raw=$(printf "%s" "$parsed_batch" | jq -c '.[1]')
+        shadow_raw=$(printf "%s" "$parsed_batch" | jq -c '.[2]')
+        rounding_raw=$(printf "%s" "$parsed_batch" | jq -c '.[3]')
+        monitors_raw=$(printf "%s" "$parsed_batch" | jq -c '.[4]')
+    else
+        # Fallback to individual queries if --batch failed
+        for attempt in 1 2; do
+            monitors_raw=$(run_with_timeout 6 hyprctl -j monitors 2>/dev/null || true)
+            if [[ -n "$monitors_raw" ]] && printf "%s" "$monitors_raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                break
+            fi
+            monitors_raw=""
+            sleep 0.2
+        done
+
+        if [[ -z "$monitors_raw" ]]; then
+            if declare -F ui_log_fail >/dev/null 2>&1; then
+                ui_log_fail "Unable to communicate with Hyprland via hyprctl IPC." \
+                    "Ensure Hyprland is running and HYPRLAND_INSTANCE_SIGNATURE is set in this session."
+            else
+                echo "[ FAIL ] Unable to communicate with Hyprland via hyprctl IPC." >&2
+            fi
+            return 1
+        fi
+
+        anim_raw=$(_query_hypr_option_json "animations:enabled" || true)
+        blur_raw=$(_query_hypr_option_json "decoration:blur:enabled" || true)
+        shadow_raw=$(_query_hypr_option_json "decoration:shadow:enabled" || true)
+        rounding_raw=$(_query_hypr_option_json "decoration:rounding" || true)
     fi
 
-    # 1. Query compositor properties using timeout-bounded hyprctl -j getoption
-    local anim_raw blur_raw shadow_raw vfr_raw
-    anim_raw=$(_query_hypr_option_json "animations:enabled" '{"int":1}' || true)
-    blur_raw=$(_query_hypr_option_json "decoration:blur:enabled" '{"int":1}' || true)
-    if ! shadow_raw=$(_query_hypr_option_json "decoration:drop_shadow" '{"int":1}'); then
-        shadow_raw=$(_query_hypr_option_json "decoration:shadow:enabled" '{"int":1}' || true)
-    fi
-    vfr_raw=$(_query_hypr_option_json "misc:vfr" '{"int":1}' || true)
+    # Extract exact live option values without inventing defaults on missing/false options
+    local anim_json blur_json shadow_json rounding_json
+    anim_json=$(printf "%s" "$anim_raw" | jq -c '
+        if (type == "object") and ((.bool | type) == "boolean") then .bool
+        elif (type == "object") and ((.int | type) == "number") then (.int != 0)
+        else "unavailable" end
+    ' 2>/dev/null || echo '"unavailable"')
 
-    local anim_val blur_val shadow_val vfr_val
-    anim_val=$(printf "%s" "$anim_raw" | jq -r 'if .int != null then .int elif .bool != null then (if .bool then 1 else 0 end) else 1 end' 2>/dev/null || echo "1")
-    blur_val=$(printf "%s" "$blur_raw" | jq -r 'if .bool != null then .bool elif .int != null then (.int == 1) elif .set != null then .set else false end' 2>/dev/null || echo "false")
-    shadow_val=$(printf "%s" "$shadow_raw" | jq -r 'if .bool != null then .bool elif .int != null then (.int == 1) elif .set != null then .set else false end' 2>/dev/null || echo "false")
-    vfr_val=$(printf "%s" "$vfr_raw" | jq -r 'if .int != null then .int elif .bool != null then (if .bool then 1 else 0 end) else 1 end' 2>/dev/null || echo "1")
+    blur_json=$(printf "%s" "$blur_raw" | jq -c '
+        if (type == "object") and ((.bool | type) == "boolean") then .bool
+        elif (type == "object") and ((.int | type) == "number") then (.int != 0)
+        else "unavailable" end
+    ' 2>/dev/null || echo '"unavailable"')
 
-    # Sanitize extracted primitives
-    [[ "$anim_val" =~ ^[01]$ ]] || anim_val=1
-    [[ "$blur_val" == "true" || "$blur_val" == "false" ]] || blur_val=false
-    [[ "$shadow_val" == "true" || "$shadow_val" == "false" ]] || shadow_val=false
-    [[ "$vfr_val" =~ ^[01]$ ]] || vfr_val=1
+    shadow_json=$(printf "%s" "$shadow_raw" | jq -c '
+        if (type == "object") and ((.bool | type) == "boolean") then .bool
+        elif (type == "object") and ((.int | type) == "number") then (.int != 0)
+        else "unavailable" end
+    ' 2>/dev/null || echo '"unavailable"')
 
-    # 2. Query DPMS status across active monitors
+    rounding_json=$(printf "%s" "$rounding_raw" | jq -c '
+        if (type == "object") and ((.int | type) == "number") then .int
+        else "unavailable" end
+    ' 2>/dev/null || echo '"unavailable"')
+
+    # Query DPMS status across active monitors
     local dpms_val
-    dpms_val=$(printf "%s" "$monitors_raw" | jq -r 'if (type == "array" and length > 0) then any(.[]; .dpmsStatus == true) else true end' 2>/dev/null || echo "true")
-    [[ "$dpms_val" == "true" || "$dpms_val" == "false" ]] || dpms_val=true
+    dpms_val=$(printf "%s" "$monitors_raw" | jq -r '
+        if (type == "array" and length > 0) then
+            any(.[] | select(.disabled == false); .dpmsStatus == true)
+        else true end
+    ' 2>/dev/null || echo "true")
+    [[ "$dpms_val" == "true" || "$dpms_val" == "false" ]] || dpms_val="true"
 
-    # 3. Discover omarchy-shell / quickshell PID scoped strictly to current user (${UID})
+    # Discover omarchy-shell / quickshell PID scoped strictly to current user (${UID})
     local qs_pid="" was_running="false"
     qs_pid=$(pgrep -u "$current_uid" -x "omarchy-shell" 2>/dev/null | head -n 1 || true)
     if [[ -z "$qs_pid" ]]; then
@@ -70,10 +116,15 @@ capture_snapshot() {
     fi
 
     if [[ -n "$qs_pid" && "$qs_pid" =~ ^[0-9]+$ ]] && (( qs_pid > 1 )); then
-        was_running=true
+        was_running="true"
     else
         qs_pid="null"
-        was_running=false
+        was_running="false"
+    fi
+
+    local stay_awake_was_active="false"
+    if [[ -f "${HOME}/.local/state/omarchy/indicators/stay-awake" ]]; then
+        stay_awake_was_active="true"
     fi
 
     local action_label="SIGSTOP"
@@ -81,29 +132,31 @@ capture_snapshot() {
         action_label="SIGSTOP"
     fi
 
-    # 4. Construct canonical JSON snapshot payload
+    # Construct canonical JSON snapshot payload
     jq -n \
       --argjson timestamp "$(date +%s)" \
       --argjson session_uid "$current_uid" \
       --arg his "${HYPRLAND_INSTANCE_SIGNATURE:-unknown}" \
-      --argjson anim "$anim_val" \
-      --argjson blur "$blur_val" \
-      --argjson shadow "$shadow_val" \
-      --argjson vfr "$vfr_val" \
+      --argjson anim "$anim_json" \
+      --argjson blur "$blur_json" \
+      --argjson shadow "$shadow_json" \
+      --argjson rounding "$rounding_json" \
       --argjson dpms "$dpms_val" \
       --argjson qs_pid "$qs_pid" \
       --argjson qs_running "$was_running" \
       --arg qs_action "$action_label" \
+      --argjson stay_awake "$stay_awake_was_active" \
       '{
-        schema_version: 1,
+        schema_version: 2,
         timestamp: $timestamp,
         session_uid: $session_uid,
         hyprland_instance_signature: $his,
+        stay_awake_was_active: $stay_awake,
         compositor_properties: {
           "animations:enabled": $anim,
           "decoration:blur:enabled": $blur,
-          "decoration:drop_shadow": $shadow,
-          "misc:vfr": $vfr,
+          "decoration:shadow:enabled": $shadow,
+          "decoration:rounding": $rounding,
           "dpms_status": $dpms
         },
         quickshell_state: {
@@ -162,10 +215,8 @@ validate_snapshot() {
       and (has("hyprland_instance_signature") and (.hyprland_instance_signature | type == "string"))
       and (has("compositor_properties") and (.compositor_properties | type == "object"))
       and (.compositor_properties |
-            (has("animations:enabled") and (.["animations:enabled"] | type == "number"))
-            and (has("decoration:blur:enabled") and (.["decoration:blur:enabled"] | type == "boolean"))
-            and (has("decoration:drop_shadow") and (.["decoration:drop_shadow"] | type == "boolean"))
-            and (has("misc:vfr") and (.["misc:vfr"] | type == "number"))
+            (has("animations:enabled") and ((.["animations:enabled"] | type == "boolean") or (.["animations:enabled"] | type == "number") or (.["animations:enabled"] == "unavailable")))
+            and (has("decoration:blur:enabled") and ((.["decoration:blur:enabled"] | type == "boolean") or (.["decoration:blur:enabled"] == "unavailable")))
             and (has("dpms_status") and (.dpms_status | type == "boolean"))
           )
       and (has("quickshell_state") and (.quickshell_state | type == "object"))

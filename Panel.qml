@@ -1,14 +1,9 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Oma Server bar button and telemetry/control dashboard popup.
-// Enforces a strict Zero-Emoji Policy: visual hierarchy is achieved via
-// monospace typography, ANSI-inspired semantic tokens, box-drawing chrome,
-// Braille geometric spinners, segmented progress bars, and bracketed badges.
 Panel {
   id: root
   moduleName: "rohirik.oma-server"
@@ -16,12 +11,13 @@ Panel {
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color barForeground: bar ? bar.barForeground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color accent: Color.accent
-  readonly property color okColor: "#4ec978"
-  readonly property color warnColor: "#e5c07b"
-  readonly property color infoColor: "#61afef"
-  readonly property color syncColor: "#c678dd"
+  readonly property color okColor: Color.accent
+  readonly property color warnColor: Qt.lighter(urgent, 1.25)
+  readonly property color infoColor: Color.accent
+  readonly property color syncColor: Color.accent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color muted: Qt.darker(foreground, 2.0)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -46,11 +42,11 @@ Panel {
   // Interactive Controls & Async Progress State
   property string selectedTimeout: "0"
   readonly property var timeoutPresets: [
-    { label: "OFF", value: "0" },
-    { label: "30M", value: "30m" },
-    { label: "1H",  value: "1h" },
-    { label: "2H",  value: "2h" },
-    { label: "4H",  value: "4h" }
+    { label: "Off", value: "0" },
+    { label: "30m", value: "30m" },
+    { label: "1h",  value: "1h" },
+    { label: "2h",  value: "2h" },
+    { label: "4h",  value: "4h" }
   ]
 
   property bool isTransitioning: false
@@ -63,17 +59,6 @@ Panel {
 
   property string errorNotice: ""
   property string recoveryHint: ""
-
-  function renderAsciiProgress(pct) {
-    var clamped = Math.max(0, Math.min(100, Number(pct) || 0))
-    var filled = Math.round(clamped / 10)
-    var empty = 10 - filled
-    var out = "["
-    for (var i = 0; i < filled; i++) out += "█"
-    for (var j = 0; j < empty; j++) out += "░"
-    out += "] " + String(clamped) + "%"
-    return out
-  }
 
   function formatElapsedTenths(ms) {
     var totalTenths = Math.max(0, Math.floor((Number(ms) || 0) / 100))
@@ -97,25 +82,25 @@ Panel {
     transitionProgress = 20
     transitionElapsedMs = 0
     actionProc.closeAfter = shouldCloseOnSuccess === true
-    actionProc.command = ["timeout", "-k", "2", "10"].concat(cmdArray)
+    actionProc.command = ["timeout", "-k", "2", "60"].concat(cmdArray)
     actionProc.running = true
   }
 
   function toggleMode() {
     if (isHomelabMode) {
-      startTransition("Restoring HOST_LAPTOP profile...", ["oma-server", "disable"], false)
+      startTransition("Restoring desktop profile...", ["oma-server", "disable"], false)
     } else {
       var args = ["oma-server", "enable", "-y"]
       if (selectedTimeout !== "" && selectedTimeout !== "0") {
         args.push("--timeout")
         args.push(selectedTimeout)
       }
-      startTransition("Engaging HOMELAB_MODE guardrails...", args, true)
+      startTransition("Switching to Homelab mode...", args, true)
     }
   }
 
   function runRescue() {
-    startTransition("Executing Emergency Rescue sequence...", ["oma-server", "rescue"], false)
+    startTransition("Running emergency rescue...", ["oma-server", "rescue"], false)
   }
 
   function inTerminal(cmd) {
@@ -129,11 +114,23 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
+    function prepareHomelabFreeze(): string {
+      root.isTransitioning = false
+      root.isHomelabMode = true
+      root.currentMode = "HOMELAB_MODE"
+      root.dpmsStatus = "OFF (Power Saving)"
+      root.quickshellStatus = "Suspended (0 CPU)"
+      root.healthStatus = "OK"
+      root.errorNotice = ""
+      root.recoveryHint = ""
+      root.close()
+      return "ok"
+    }
   }
 
   Process {
     id: statusProc
-    command: ["timeout", "-k", "2", "4", "oma-server", "status", "--json"]
+    command: ["timeout", "-k", "2", "15", "oma-server", "status", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -141,7 +138,7 @@ Panel {
           var data = JSON.parse(text)
           root.isHomelabMode = data.is_homelab === true
           root.currentMode = String(data.mode || "HOST_LAPTOP")
-          root.sinceTime = String(data.since || "N/A (Desktop Profile)")
+          root.sinceTime = String(data.since || "Desktop profile")
           root.elapsedHuman = String(data.elapsed_human || "00h 00m 00s")
           root.inhibitorStatus = String(data.inhibitor || "Inactive")
           root.timeoutStatus = String(data.timeout_status || "Standby")
@@ -153,7 +150,7 @@ Panel {
           root.loaded = true
           if (root.healthStatus === "DEGRADED" && root.errorNotice === "") {
             root.errorNotice = "Inhibitor process is stale while Homelab snapshot is active."
-            root.recoveryHint = "Click [ RESCUE ] below or run 'oma-server rescue' to resynchronize."
+            root.recoveryHint = "Use Rescue below or run 'oma-server rescue' to resynchronize."
           } else if (root.healthStatus === "OK" && root.errorNotice.indexOf("stale") >= 0) {
             root.errorNotice = ""
             root.recoveryHint = ""
@@ -182,7 +179,7 @@ Panel {
       if (exitCode !== 0) {
         var errTxt = String(actionStderr.text || "").replace(/\x1b\[[0-9;]*m/g, "").trim()
         root.errorNotice = errTxt !== "" ? errTxt.split("\n")[0] : ("Operation exited with code " + String(exitCode))
-        root.recoveryHint = "Use [ RESCUE ] to force baseline restoration or inspect CLI logs."
+        root.recoveryHint = "Use Rescue to restore baseline or inspect CLI logs."
       } else {
         root.errorNotice = ""
         root.recoveryHint = ""
@@ -225,26 +222,21 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.isTransitioning ? root.spinnerChar : (root.isHomelabMode ? "◆" : "◇")
-    active: root.isHomelabMode
-    tooltipText: "OMA-SERVER // " + (
-      root.isTransitioning
-        ? "[ SYNCING ] " + root.transitionLabel
-        : (root.isHomelabMode ? "[ OK ] HOMELAB_MODE (" + root.elapsedHuman + ")" : "[ INFO ] HOST_LAPTOP")
-    )
+    tooltipText: root.isTransitioning
+      ? root.transitionLabel
+      : (root.isHomelabMode ? "Homelab Mode · Screen Off (" + root.elapsedHuman + ")" : "Laptop Mode · Screen Lit")
     onPressed: function(code) {
       root.toggle()
     }
 
-    Rectangle {
-      visible: root.isHomelabMode || root.healthStatus === "DEGRADED"
-      width: Style.space(6)
-      height: width
-      radius: width / 2
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      anchors.margins: Style.space(2)
-      color: root.healthStatus === "DEGRADED" ? root.warnColor : root.okColor
+    iconComponent: Component {
+      LaptopScreenIcon {
+        anchors.fill: parent
+        lit: !root.isHomelabMode
+        syncing: root.isTransitioning
+        strokeColor: root.isHomelabMode ? Qt.darker(root.barForeground, 1.35) : root.barForeground
+        litColor: root.barForeground
+      }
     }
   }
 
@@ -255,7 +247,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(390))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
@@ -276,186 +268,152 @@ Panel {
         Column {
           id: column
           width: flick.width
-          spacing: Style.space(10)
+          spacing: Style.space(14)
 
-          // ---------- 1. Structured Dashboard Header ----------
-          Rectangle {
+          // ---------- 1. Hero Header ----------
+          Item {
             width: parent.width
-            height: headerCol.implicitHeight + Style.space(16)
-            radius: Style.cornerRadius
-            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
-            border.width: 1
-            border.color: root.isHomelabMode
-              ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.45)
-              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+            implicitHeight: Math.max(heroIcon.height, heroLabels.implicitHeight, statusPill.height)
+
+            LaptopScreenIcon {
+              id: heroIcon
+              width: Style.space(28)
+              height: Style.space(28)
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              lit: !root.isHomelabMode
+              syncing: root.isTransitioning
+              strokeColor: root.isHomelabMode ? root.dim : root.foreground
+              litColor: root.accent
+            }
 
             Column {
-              id: headerCol
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              spacing: Style.space(4)
+              id: heroLabels
+              anchors.left: heroIcon.right
+              anchors.leftMargin: Style.space(14)
+              anchors.right: statusPill.left
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
 
-              Row {
+              Text {
+                textFormat: Text.PlainText
+                text: "Oma Server"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
                 width: parent.width
-                spacing: Style.space(8)
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.isTransitioning ? root.spinnerChar : (root.isHomelabMode ? "◆" : "◇")
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.title
-                  font.bold: true
-                  color: root.isTransitioning
-                    ? root.syncColor
-                    : (root.isHomelabMode ? root.okColor : root.accent)
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: "OMA-SERVER // NODE CONTROLLER"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  color: root.foreground
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                Item {
-                  width: Math.max(0, parent.width - parent.children[0].width - parent.children[1].width - statusPill.width - Style.space(24))
-                  height: 1
-                }
-
-                Rectangle {
-                  id: statusPill
-                  height: badgeLabel.implicitHeight + Style.space(4)
-                  width: badgeLabel.implicitWidth + Style.space(10)
-                  radius: Style.cornerRadius
-                  anchors.verticalCenter: parent.verticalCenter
-                  color: Qt.rgba(badgeLabel.color.r, badgeLabel.color.g, badgeLabel.color.b, 0.14)
-                  border.width: 1
-                  border.color: Qt.rgba(badgeLabel.color.r, badgeLabel.color.g, badgeLabel.color.b, 0.55)
-
-                  Text {
-                    id: badgeLabel
-                    textFormat: Text.PlainText
-                    anchors.centerIn: parent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                    text: root.isTransitioning
-                      ? "[ SYNCING ]"
-                      : (root.errorNotice !== ""
-                        ? "[ FAIL ]"
-                        : (root.healthStatus === "DEGRADED"
-                          ? "[ WARN ]"
-                          : (root.isHomelabMode ? "[ OK ]" : "[ INFO ]")))
-                    color: root.isTransitioning
-                      ? root.syncColor
-                      : (root.errorNotice !== ""
-                        ? root.urgent
-                        : (root.healthStatus === "DEGRADED"
-                          ? root.warnColor
-                          : (root.isHomelabMode ? root.okColor : root.infoColor)))
-                  }
-                }
               }
 
-              Row {
+              Text {
+                textFormat: Text.PlainText
+                text: root.isTransitioning
+                  ? root.transitionLabel.toUpperCase()
+                  : (root.isHomelabMode ? ("HOMELAB MODE · " + root.elapsedHuman) : "LAPTOP MODE · SCREEN LIT")
+                color: root.isHomelabMode ? root.okColor : Qt.darker(root.foreground, 1.4)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.1
+                elide: Text.ElideRight
                 width: parent.width
-                spacing: Style.space(8)
+              }
+            }
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.isHomelabMode
-                    ? "PROFILE: HOMELAB_MODE (HEADLESS COMPUTE)"
-                    : "PROFILE: HOST_LAPTOP (INTERACTIVE DESKTOP)"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  color: root.isHomelabMode ? root.okColor : root.dim
-                }
+            Rectangle {
+              id: statusPill
+              height: badgeLabel.implicitHeight + Style.space(6)
+              width: badgeLabel.implicitWidth + Style.space(14)
+              radius: height / 2
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              color: Qt.rgba(badgeLabel.color.r, badgeLabel.color.g, badgeLabel.color.b, 0.14)
+              border.width: 1
+              border.color: Qt.rgba(badgeLabel.color.r, badgeLabel.color.g, badgeLabel.color.b, 0.45)
 
-                Item {
-                  width: Math.max(0, parent.width - parent.children[0].width - uptimeLabel.width - Style.space(16))
-                  height: 1
-                }
-
-                Text {
-                  id: uptimeLabel
-                  textFormat: Text.PlainText
-                  text: root.isHomelabMode ? ("ELAPSED " + root.elapsedHuman) : "IDLE 00h 00m 00s"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  color: root.dim
-                }
+              Text {
+                id: badgeLabel
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                text: root.isTransitioning
+                  ? "SYNCING"
+                  : (root.errorNotice !== ""
+                    ? "ERROR"
+                    : (root.healthStatus === "DEGRADED"
+                      ? "DEGRADED"
+                      : (root.isHomelabMode ? "HOMELAB" : "LAPTOP")))
+                color: root.isTransitioning
+                  ? root.syncColor
+                  : (root.errorNotice !== ""
+                    ? root.urgent
+                    : (root.healthStatus === "DEGRADED"
+                      ? root.warnColor
+                      : (root.isHomelabMode ? root.okColor : root.accent)))
               }
             }
           }
 
-          // ---------- 2. Dynamic Async Progress & Loader Banner ----------
-          Rectangle {
+          // ---------- 2. Smooth Progress Bar (Shown During Transitions) ----------
+          Column {
             visible: root.isTransitioning || (!root.loaded && statusProc.running)
             width: parent.width
-            height: progressCol.implicitHeight + Style.space(14)
-            radius: Style.cornerRadius
-            color: Qt.rgba(root.syncColor.r, root.syncColor.g, root.syncColor.b, 0.08)
-            border.width: 1
-            border.color: Qt.rgba(root.syncColor.r, root.syncColor.g, root.syncColor.b, 0.4)
+            spacing: Style.space(6)
 
-            Column {
-              id: progressCol
-              anchors.fill: parent
-              anchors.margins: Style.space(7)
-              spacing: Style.space(4)
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(6)
 
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.spinnerChar + " [ SYNCING ]"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  color: root.syncColor
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.isTransitioning ? root.transitionLabel : "Polling system telemetry..."
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  color: root.foreground
-                  elide: Text.ElideRight
-                }
+              Rectangle {
+                id: barTrack
+                anchors.fill: parent
+                radius: height / 2
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
               }
 
-              Row {
-                width: parent.width
-                spacing: Style.space(8)
+              Rectangle {
+                anchors.left: barTrack.left
+                anchors.verticalCenter: barTrack.verticalCenter
+                height: barTrack.height
+                radius: barTrack.radius
+                color: root.accent
+                width: Math.max(barTrack.height, barTrack.width * ((root.isTransitioning ? root.transitionProgress : 50) / 100.0))
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.renderAsciiProgress(root.isTransitioning ? root.transitionProgress : 50)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  color: root.accent
-                }
+                Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+              }
+            }
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: "│ ELAPSED " + root.formatElapsedTenths(root.transitionElapsedMs)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  color: root.dim
-                }
+            Row {
+              width: parent.width
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.isTransitioning ? root.transitionLabel : "Polling system telemetry..."
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                color: root.dim
+              }
+
+              Item {
+                width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth)
+                height: 1
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.formatElapsedTenths(root.transitionElapsedMs)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                color: root.dim
               }
             }
           }
 
-          // ---------- 3. Inline Error / Degraded Recovery Banner ----------
+          // ---------- 3. Error / Degraded Notice ----------
           Rectangle {
             visible: root.errorNotice !== ""
             width: parent.width
@@ -463,7 +421,7 @@ Panel {
             radius: Style.cornerRadius
             color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.10)
             border.width: 1
-            border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.55)
+            border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.50)
 
             Column {
               id: errCol
@@ -475,7 +433,7 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
-                text: (root.healthStatus === "DEGRADED" ? "[ WARN ] " : "[ FAIL ] ") + root.errorNotice
+                text: root.errorNotice
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
@@ -487,7 +445,7 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
-                text: "└─ Hint: " + root.recoveryHint
+                text: root.recoveryHint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 color: root.dim
@@ -495,134 +453,67 @@ Panel {
             }
           }
 
-          // ---------- 4. Box-Drawn Telemetry & Guardrail Matrix ----------
-          Rectangle {
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          // ---------- 4. Subsystem Telemetry ----------
+          Column {
             width: parent.width
-            height: telemetryCol.implicitHeight + Style.space(16)
-            radius: Style.cornerRadius
-            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.03)
-            border.width: 1
-            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+            spacing: Style.spacing.labelGap
 
-            Column {
-              id: telemetryCol
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              spacing: Style.space(5)
+            InfoPair {
+              label: "Sleep & lid inhibit"
+              value: root.inhibitorStatus
+              valueColor: root.inhibitorStatus.indexOf("Active") === 0 ? root.okColor : (root.inhibitorStatus === "Stale" ? root.warnColor : root.foreground)
+            }
 
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "┌─ SUBSYSTEM TELEMETRY & SAFETY GUARDRAILS ────────┐"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                color: root.dim
-                elide: Text.ElideRight
-              }
+            InfoPair {
+              label: "Display output"
+              value: root.dpmsStatus
+              valueColor: root.dpmsStatus.indexOf("OFF") === 0 ? root.okColor : root.foreground
+            }
 
-              Repeater {
-                model: [
-                  {
-                    key: "│ Power / Lid Inhibit",
-                    badge: root.inhibitorStatus.indexOf("Active") === 0 ? "[ OK ]" : (root.inhibitorStatus === "Stale" ? "[ WARN ]" : "[ STANDBY ]"),
-                    badgeColor: root.inhibitorStatus.indexOf("Active") === 0 ? root.okColor : (root.inhibitorStatus === "Stale" ? root.warnColor : root.dim),
-                    val: root.inhibitorStatus
-                  },
-                  {
-                    key: "│ Display Output",
-                    badge: root.dpmsStatus.indexOf("OFF") === 0 ? "[ OK ]" : "[ INFO ]",
-                    badgeColor: root.dpmsStatus.indexOf("OFF") === 0 ? root.okColor : root.infoColor,
-                    val: root.dpmsStatus
-                  },
-                  {
-                    key: "│ Quickshell Loop",
-                    badge: root.quickshellStatus.indexOf("Suspended") === 0 ? "[ OK ]" : "[ INFO ]",
-                    badgeColor: root.quickshellStatus.indexOf("Suspended") === 0 ? root.okColor : root.infoColor,
-                    val: root.quickshellStatus
-                  },
-                  {
-                    key: "│ Dead-Man Timer",
-                    badge: root.timeoutStatus.indexOf("Active") === 0 ? "[ OK ]" : "[ STANDBY ]",
-                    badgeColor: root.timeoutStatus.indexOf("Active") === 0 ? root.okColor : root.dim,
-                    val: root.timeoutStatus
-                  },
-                  {
-                    key: "│ Tier-0 Whitelist",
-                    badge: "[ GUARDED ]",
-                    badgeColor: root.infoColor,
-                    val: String(root.protectedActive) + "/" + String(root.protectedTotal) + " active"
-                  },
-                  {
-                    key: "│ Active Since",
-                    badge: root.isHomelabMode ? "[ OK ]" : "[ INFO ]",
-                    badgeColor: root.isHomelabMode ? root.okColor : root.dim,
-                    val: root.sinceTime
-                  }
-                ]
+            InfoPair {
+              label: "Shell event loop"
+              value: root.quickshellStatus
+              valueColor: root.quickshellStatus.indexOf("Suspended") === 0 ? root.okColor : root.foreground
+            }
 
-                delegate: Row {
-                  required property var modelData
-                  width: telemetryCol.width
-                  spacing: Style.space(6)
+            InfoPair {
+              label: "Auto-revert timer"
+              value: root.timeoutStatus
+              valueColor: root.timeoutStatus.indexOf("Active") === 0 ? root.okColor : root.foreground
+            }
 
-                  Text {
-                    width: Style.space(132)
-                    textFormat: Text.PlainText
-                    text: modelData.key
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    color: root.dim
-                    elide: Text.ElideRight
-                  }
+            InfoPair {
+              label: "Protected services"
+              value: String(root.protectedActive) + " / " + String(root.protectedTotal) + " active"
+              valueColor: root.foreground
+            }
 
-                  Text {
-                    width: Style.space(76)
-                    textFormat: Text.PlainText
-                    text: modelData.badge
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                    color: modelData.badgeColor
-                  }
-
-                  Text {
-                    width: Math.max(0, parent.width - Style.space(220))
-                    textFormat: Text.PlainText
-                    text: modelData.val
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    color: root.foreground
-                    elide: Text.ElideRight
-                  }
-                }
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "└──────────────────────────────────────────────────┘"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                color: root.dim
-                elide: Text.ElideRight
-              }
+            InfoPair {
+              visible: root.isHomelabMode
+              label: "Active since"
+              value: root.sinceTime
+              valueColor: root.foreground
             }
           }
 
-          // ---------- 5. Dead Man's Switch (Auto-Revert Timer) Selector ----------
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          // ---------- 5. Auto-Revert Timer Selector ----------
           Column {
             visible: !root.isHomelabMode
             width: parent.width
-            spacing: Style.space(4)
+            spacing: Style.space(8)
 
-            Text {
-              textFormat: Text.PlainText
-              text: "DEAD MAN'S SWITCH // AUTO-REVERT TIMEOUT PRESET"
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              color: root.dim
+            PanelSectionHeader {
+              text: "AUTO-REVERT TIMER"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
             }
 
             Row {
@@ -634,13 +525,15 @@ Panel {
                 delegate: Button {
                   required property var modelData
                   width: (parent.width - Style.space(6) * 4) / 5
-                  fontSize: Style.font.caption
-                  verticalPadding: Style.space(5)
+                  fontSize: Style.font.bodySmall
+                  verticalPadding: Style.spacing.controlPaddingY
                   horizontalPadding: Style.space(4)
                   bordered: true
+                  active: root.selectedTimeout === modelData.value
                   selected: root.selectedTimeout === modelData.value
+                  foreground: root.foreground
                   fontFamily: root.fontFamily
-                  text: "[ " + modelData.label + " ]"
+                  text: modelData.label
                   onClicked: root.selectedTimeout = modelData.value
                 }
               }
@@ -655,17 +548,19 @@ Panel {
             verticalPadding: Style.space(9)
             horizontalPadding: Style.space(12)
             bordered: true
+            active: root.isHomelabMode
             selected: root.isHomelabMode
+            foreground: root.foreground
             fontFamily: root.fontFamily
             text: root.isTransitioning
-              ? (root.spinnerChar + "  [ SYNCING ] EXECUTING TRANSITION...")
+              ? (root.spinnerChar + "  " + root.transitionLabel)
               : (root.isHomelabMode
-                ? "▸ [ RESTORE ] RETURN TO HOST_LAPTOP MODE"
-                : ("▸ [ ENABLE ] SWITCH TO HOMELAB_MODE" + (root.selectedTimeout !== "0" ? " (" + root.selectedTimeout.toUpperCase() + ")" : "")))
+                ? "Restore Desktop Mode"
+                : ("Enable Homelab Mode" + (root.selectedTimeout !== "0" ? " (" + root.selectedTimeout + ")" : "")))
             onClicked: root.toggleMode()
           }
 
-          // ---------- 7. Secondary Diagnostic & Emergency Controls ----------
+          // ---------- 7. Secondary Controls ----------
           Row {
             width: parent.width
             spacing: Style.space(8)
@@ -673,23 +568,25 @@ Panel {
             Button {
               width: (parent.width - Style.space(16)) / 3
               enabled: !root.isTransitioning
-              fontSize: Style.font.caption
-              verticalPadding: Style.space(6)
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.spacing.controlPaddingY
               bordered: true
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              text: "[ DIFF ] PLAN"
-              tooltipText: "Open in-memory transition diff & Tier-0 service audit in terminal"
+              text: "Plan Diff"
+              tooltipText: "Open in-memory transition diff and Tier-0 service audit in terminal"
               onClicked: root.inTerminal("oma-server diff")
             }
 
             Button {
               width: (parent.width - Style.space(16)) / 3
               enabled: !root.isTransitioning
-              fontSize: Style.font.caption
-              verticalPadding: Style.space(6)
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.spacing.controlPaddingY
               bordered: true
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              text: "[ SYNC ] REFRESH"
+              text: "Refresh"
               tooltipText: "Poll live compositor, DPMS, and inhibitor telemetry now"
               onClicked: root.refresh()
             }
@@ -697,18 +594,113 @@ Panel {
             Button {
               width: (parent.width - Style.space(16)) / 3
               enabled: !root.isTransitioning
-              fontSize: Style.font.caption
-              verticalPadding: Style.space(6)
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.spacing.controlPaddingY
               bordered: true
               foreground: root.urgent
               fontFamily: root.fontFamily
-              text: "[ RESCUE ] RESET"
+              text: "Rescue"
               tooltipText: "Emergency recovery: unfreeze Quickshell, wake displays, purge locks"
               onClicked: root.runRescue()
             }
           }
         }
       }
+    }
+  }
+
+  // Crisp vector laptop icon whose screen is illuminated in Laptop Mode
+  // and dark/off in Homelab Mode (reflecting DPMS display powerdown).
+  component LaptopScreenIcon: Item {
+    id: iconRoot
+    property bool lit: true
+    property bool syncing: false
+    property color strokeColor: root.barForeground
+    property color litColor: root.barForeground
+    property real pulseOpacity: 0.85
+
+    SequentialAnimation on pulseOpacity {
+      running: iconRoot.syncing
+      loops: Animation.Infinite
+      NumberAnimation { from: 0.90; to: 0.15; duration: 420; easing.type: Easing.InOutSine }
+      NumberAnimation { from: 0.15; to: 0.90; duration: 420; easing.type: Easing.InOutSine }
+    }
+
+    // Laptop display lid / bezel
+    Rectangle {
+      id: screenBezel
+      width: Math.round(iconRoot.width * 0.82)
+      height: Math.round(iconRoot.height * 0.58)
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: parent.top
+      anchors.topMargin: Math.round(iconRoot.height * 0.13)
+      radius: Math.max(2, Math.round(iconRoot.width * 0.10))
+      color: "transparent"
+      border.width: Math.max(1.5, Math.round(iconRoot.width * 0.09))
+      border.color: iconRoot.strokeColor
+
+      Behavior on border.color { ColorAnimation { duration: 180 } }
+
+      // Illuminated inner LCD panel when in Laptop Mode
+      Rectangle {
+        id: screenPanel
+        anchors.fill: parent
+        anchors.margins: Math.max(2, Math.round(screenBezel.border.width + 1))
+        radius: Math.max(1, screenBezel.radius - 1)
+        color: iconRoot.litColor
+        opacity: iconRoot.syncing ? iconRoot.pulseOpacity : (iconRoot.lit ? 0.92 : 0.0)
+
+        Behavior on opacity {
+          enabled: !iconRoot.syncing
+          NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
+        }
+        Behavior on color { ColorAnimation { duration: 180 } }
+      }
+    }
+
+    // Laptop keyboard deck / base
+    Rectangle {
+      width: Math.round(iconRoot.width * 0.98)
+      height: Math.max(2, Math.round(iconRoot.height * 0.12))
+      radius: height / 2
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: screenBezel.bottom
+      anchors.topMargin: Math.max(1, Math.round(iconRoot.height * 0.04))
+      color: iconRoot.strokeColor
+
+      Behavior on color { ColorAnimation { duration: 180 } }
+    }
+  }
+
+  component InfoPair: Row {
+    property string label: ""
+    property string value: ""
+    property color valueColor: root.foreground
+
+    width: parent.width
+    spacing: Style.space(8)
+
+    Text {
+      textFormat: Text.PlainText
+      text: parent.label
+      color: root.foreground
+      opacity: 0.6
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    Item {
+      width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth - parent.spacing * 2)
+      height: 1
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      text: parent.value
+      color: parent.valueColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
     }
   }
 }
