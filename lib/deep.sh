@@ -60,7 +60,7 @@ DEEP_POLL="${OMA_DEEP_POLL_INTERVAL:-1}"
 DEEP_PANIC_HINT="sudo systemctl start display-manager"
 # S2: the helper source is pinned by hash (test/deep.test.py keeps this in sync);
 # the sudoers rule is generated here, never trusted from the user-writable plugin dir.
-DEEP_HELPER_SHA256="988bfab6eab98312683804088cad13c3917906f436406834a9ee72f5684f7db1"
+DEEP_HELPER_SHA256="09700eb01e6df72d82faac3fef73f0a3d49e1f266a36bcad70988c8da7ba4b65"
 DEEP_HELPER_VERBS=(check dm-stop dm-start dm-restart inhibit-start inhibit-stop revert-disarm exit)
 
 # Prints the exact sudoers file deep-setup installs.
@@ -565,7 +565,9 @@ deep_follow_seconds() {
 # Tails deep.log until the worker reaches DEEP_SERVER or rolls back.
 deep_follow_enter() {
     local config_file="${1:-}"
-    local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-$(deep_follow_seconds "$config_file")}"
+    local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}"
+    # INFO-5: never feed an unvalidated env value into arithmetic.
+    [[ "$follow_max" =~ ^[0-9]+$ ]] || follow_max=$(deep_follow_seconds "$config_file")
     local deadline=$(( $(date +%s) + follow_max ))
     local printed=0 total line state
     _deep_follow_print() {
@@ -1195,4 +1197,130 @@ deep_render_plan() {
         ui_log_warn "Could not list Hyprland windows."
     fi
     ui_log_info "Way back: 'oma-server disable' (SSH or Ctrl+Alt+F2), reboot, or '${DEEP_PANIC_HINT}'."
+}
+
+# -----------------------------------------------------------------------------
+# 9. Optional deep console shell (`oma-server deep-shell`), user-level only.
+# Default "none" = plain tty1 `login:` console and no profile edits at all.
+# Any other choice writes [deep] shell = "<name>" and a managed block into the
+# login profile that runs libexec/oma-server-deep-shell (tty1 + DEEP_SERVER only).
+# -----------------------------------------------------------------------------
+DEEP_SHELL_CHOICES=(none tmux btop tuios zellij custom)
+DEEP_SHELL_BEGIN="# >>> oma-server deep shell >>>"
+DEEP_SHELL_END="# <<< oma-server deep shell <<<"
+
+deep_shell_profile_file() {
+    case "$(basename -- "${SHELL:-bash}")" in
+        zsh) printf '%s' "${ZDOTDIR:-$HOME}/.zprofile" ;;
+        *)   printf '%s' "$HOME/.bash_profile" ;;
+    esac
+}
+
+deep_shell_binary() {
+    case "$1" in
+        none) printf '' ;; custom) printf 'bash' ;; *) printf '%s' "$1" ;;
+    esac
+}
+
+# Sets or adds `key = "value"` inside [deep] (atomic rewrite, keeps comments).
+deep_config_set_string() {
+    local file="$1" key="$2" val="$3" tmp
+    [[ -f "$file" && ! -L "$file" ]] || { ui_log_fail "Config '$file' missing or a symlink."; return 1; }
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    awk -v k="$key" -v v="$val" '
+        function emit() { printf "%s = \"%s\"\n", k, v; done=1 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            if (in_sec && !done) emit()
+            s=$0; gsub(/[[:space:]]/,"",s); in_sec=(s=="[deep]"); print; next
+        }
+        in_sec && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { if (!done) emit(); next }
+        { print }
+        END { if (!done) { if (!in_sec) print "\n[deep]"; emit() } }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+deep_shell_profile_remove() {
+    local prof="$1" tmp
+    [[ -f "$prof" ]] || return 0
+    grep -qF "$DEEP_SHELL_BEGIN" "$prof" || return 0
+    tmp=$(mktemp "${prof}.XXXXXX") || return 1
+    # Drop the block and the one blank line deep_shell_profile_add put before it.
+    awk -v b="$DEEP_SHELL_BEGIN" -v e="$DEEP_SHELL_END" '
+        $0==b { held=0; skip=1; next }  $0==e { skip=0; next }  skip { next }
+        held { print ""; held=0 }  $0=="" { held=1; next }  { print }
+        END { if (held) print "" }' "$prof" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$prof" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$prof"
+}
+
+deep_shell_profile_add() {
+    local prof="$1" launcher="$2"
+    deep_shell_profile_remove "$prof" || return 1
+    [[ -L "$prof" ]] && { ui_log_fail "'$prof' is a symlink; add the block by hand."; return 1; }
+    # The launcher path is written into a shell profile: refuse anything that could be
+    # interpreted there.
+    if [[ "$launcher" == *[\"\$\`\\]* || "$launcher" == *$'\n'* ]]; then
+        ui_log_fail "Launcher path '$launcher' contains shell metacharacters; add the block by hand."
+        return 1
+    fi
+    # shellcheck disable=SC2016  # literal $(tty) belongs in the profile, not expanded here
+    {
+        printf '\n%s\n' "$DEEP_SHELL_BEGIN"
+        printf '# Added by `oma-server deep-shell`. Runs only on tty1 while Deep Server Mode is active.\n'
+        printf '# Remove with: oma-server deep-shell none\n'
+        printf 'if [ "$(tty 2>/dev/null)" = /dev/tty1 ] && [ -x "%s" ]; then\n' "$launcher"
+        printf '    "%s" login\n' "$launcher"
+        printf 'fi\n%s\n' "$DEEP_SHELL_END"
+    } >> "$prof"
+}
+
+# oma-server deep-shell            -> show current choice and what is installed
+# oma-server deep-shell <name>     -> set it (none removes the profile block)
+# oma-server deep-shell custom --command "<cmd>"
+deep_shell_cmd() {
+    local plugin_root="$1" config_file="$2"; shift 2
+    local launcher="$plugin_root/libexec/oma-server-deep-shell"
+    local prof; prof=$(deep_shell_profile_file)
+    local current; current=$(config_get_scalar "$config_file" "deep" "shell" "none")
+
+    if (( $# == 0 )); then
+        ui_log_info "Deep console shell: $current (profile: $prof)"
+        local c b mark
+        for c in "${DEEP_SHELL_CHOICES[@]}"; do
+            b=$(deep_shell_binary "$c"); mark="installed"
+            [[ -n "$b" ]] && ! command -v "$b" >/dev/null 2>&1 && mark="not installed"
+            [[ "$c" == none ]] && mark="plain console + login: prompt (default)"
+            [[ "$c" == custom ]] && mark="[deep] shell_command"
+            printf '  %s %-7s %s\n' "$([[ $c == "$current" ]] && echo '*' || echo ' ')" "$c" "$mark"
+        done
+        return 0
+    fi
+
+    local choice="$1"; shift
+    if [[ " ${DEEP_SHELL_CHOICES[*]} " != *" $choice "* ]]; then
+        ui_log_fail "Unknown deep shell '$choice'." "Choose one of: ${DEEP_SHELL_CHOICES[*]}"
+        return 1
+    fi
+    if [[ "$choice" == custom ]]; then
+        [[ "${1:-}" == "--command" && -n "${2:-}" ]] || { ui_log_fail "custom needs --command \"<cmd>\"."; return 1; }
+        [[ "$2" != *'"'* && "$2" != *$'\n'* && "$2" != *\\* ]] || { ui_log_fail "The command may not contain double quotes, backslashes or newlines."; return 1; }
+        deep_config_set_string "$config_file" "shell_command" "$2" || return 1
+    fi
+    deep_config_set_string "$config_file" "shell" "$choice" || return 1
+
+    if [[ "$choice" == none ]]; then
+        deep_shell_profile_remove "$prof" || return 1
+        ui_log_ok "Deep console: plain shell with a login: prompt (profile block removed)."
+        return 0
+    fi
+    [[ -x "$launcher" ]] || { ui_log_fail "Launcher '$launcher' missing; re-run install.sh."; return 1; }
+    deep_shell_profile_add "$prof" "$launcher" || return 1
+    local b; b=$(deep_shell_binary "$choice")
+    if ! command -v "$b" >/dev/null 2>&1; then
+        ui_log_warn "'$b' is not installed yet; tty1 will fall back to the plain shell until it is."
+    fi
+    ui_log_ok "Deep console: log in on tty1, then $choice starts (any key within 3 s skips it; quitting returns to the shell)."
 }

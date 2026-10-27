@@ -1,8 +1,9 @@
 #!/usr/bin/env -S bash -p
 # bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
 # Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
-# so exported functions/SHELLOPTS from the caller are dropped here as well.
-[[ $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # ~/.config/omarchy/hooks/post-boot.d/99-server-profile-check.sh
 # Post-boot and session recovery hook for oma-server (Omarchy Server-Mode).
 # Guarantees that any unexpected reboot, crash, or session restart cleanly

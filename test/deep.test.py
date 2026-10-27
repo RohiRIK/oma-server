@@ -823,6 +823,9 @@ class InstallUninstallDeepTests(DeepSandbox):
         self.assertFalse(any(c.startswith("sudo") for c in self.calls()))
         self.assertIn("allowed = false", self.cfg.read_text())
         self.assertTrue((self.cfg_dir / "libexec/oma-server-deep-helper").is_file())
+        launcher = self.cfg_dir / "libexec/oma-server-deep-shell"
+        self.assertTrue(launcher.is_file() and os.access(launcher, os.X_OK))
+        self.assertFalse((self.home / ".bash_profile").exists(), "install must not touch login profiles")
 
     def test_uninstall_refuses_while_deep_active(self):
         self.run_script("install.sh")
@@ -1446,7 +1449,8 @@ class FollowUpFixTests3(DeepSandbox):
         self.assertEqual(self.follow_seconds({"job_wait_seconds": 9999}), 180 + 45 + 60)
         src = (ROOT / "lib/deep.sh").read_text()
         self.assertIn('deep_follow_enter "$config_file"', src)
-        self.assertIn('${OMA_DEEP_FOLLOW_SECONDS:-$(deep_follow_seconds "$config_file")}', src)
+        # INFO-5: the env override is validated, then falls back to the computed deadline.
+        self.assertIn('[[ "$follow_max" =~ ^[0-9]+$ ]] || follow_max=$(deep_follow_seconds "$config_file")', src)
 
     # ---- N4: status flags allowed-but-missing helper ----
     def test_n4_status_degraded_when_allowed_but_helper_missing(self):
@@ -1612,7 +1616,7 @@ echo "oma-server $*" >> "{self.log}"
             self.assertIn("real sudo reachable", res.stderr)
 
     def test_n8_reexec_line_is_first_body_line(self):
-        line = '[[ $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"'
+        line = '[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"'
         for f in ("bin/oma-server", "bin/omarchy-server-mode", "uninstall.sh", "hooks/post-boot.d/99-server-profile-check.sh"):
             body = [l for l in (ROOT / f).read_text().splitlines()[1:] if l.strip() and not l.startswith("#")]
             self.assertEqual(body[0], line, f)
@@ -1622,6 +1626,357 @@ echo "oma-server $*" >> "{self.log}"
         src = (ROOT / "lib/transition.sh").read_text()
         self.assertNotIn('bash -c "', src)
         self.assertEqual(src.count('bash -p -c "'), 3)
+
+
+LAUNCHER = ROOT / "libexec/oma-server-deep-shell"
+
+
+class DeepShellLauncherTests(unittest.TestCase):
+    """libexec/oma-server-deep-shell login: tty1 + DEEP_SERVER only, falls back to the plain shell."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="oma-deep-shell-")
+        self.base = pathlib.Path(self.tmp.name)
+        self.home = self.base / "home"
+        self.cfg = self.home / ".config/omarchy/plugins/server-mode/config.toml"
+        self.cfg.parent.mkdir(parents=True)
+        self.state = self.home / ".local/state/oma-server/deep.json"
+        self.state.parent.mkdir(parents=True)
+        self.log = self.base / "tui.log"
+        self.log.touch()
+        # Minimal PATH: only what the launcher needs, so host-installed TUIs never leak in.
+        self.tools = self.base / "tools"
+        self.tools.mkdir()
+        for b in ("awk", "jq", "stty", "cat", "env", "bash", "sh", "clear", "tput"):
+            real = shutil.which(b)
+            if real:
+                (self.tools / b).symlink_to(real)
+        self.stubs = self.base / "stubs"
+        self.stubs.mkdir()
+        write_executable(self.stubs / "tty", '#!/usr/bin/env bash\necho "${OMA_TEST_TTY:-/dev/tty1}"\n')
+        self.write_config("none")
+        self.write_state("DEEP_SERVER")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_config(self, shell, command=""):
+        src = (ROOT / "config/config.toml").read_text()
+        src = src.replace('shell = "none"', f'shell = "{shell}"').replace('shell_command = ""', f'shell_command = "{command}"')
+        self.cfg.write_text(src)
+
+    def write_state(self, state):
+        self.state.write_text(json.dumps({"state": state}))
+
+    def stub_tui(self, name, rc=0):
+        write_executable(self.stubs / name, f'#!/usr/bin/env bash\necho "{name}${{*:+ $*}}" >> "{self.log}"\nexit {rc}\n')
+
+    def tui_calls(self):
+        return self.log.read_text().splitlines()
+
+    def login(self, keys="", extra=None):
+        if not shutil.which("script"):
+            self.skipTest("util-linux 'script' not available")
+        env = {"PATH": f"{self.stubs}:{self.tools}", "HOME": str(self.home), "TERM": "dumb",
+               "OMA_DEEP_SHELL_WAIT": "0.3"}
+        if extra:
+            env.update(extra)
+        # Keep stdin open (no EOF) unless keys are sent: an EOF would reach the pty as ^D,
+        # which read -n1 counts as a key press. Output goes to a file to avoid pipe stalls.
+        import time
+        outf = self.base / "login.out"
+        with open(outf, "w") as fh:
+            proc = subprocess.Popen([shutil.which("script"), "-qec", f"{LAUNCHER} login; echo __RC=$?", "/dev/null"],
+                                    stdin=subprocess.PIPE, stdout=fh, stderr=subprocess.STDOUT, text=True, env=env)
+            if keys:
+                proc.stdin.write(keys)
+                proc.stdin.flush()
+            deadline = time.time() + 30
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdin.close()
+            proc.wait()
+        text_out = outf.read_text(errors="replace")
+        res = subprocess.CompletedProcess(proc.args, proc.returncode, text_out, "")
+        out = ANSI_RE.sub("", res.stdout + res.stderr)
+        m = re.search(r"__RC=(\d+)", out)
+        res.rc = int(m.group(1)) if m else -1
+        res.plain = out
+        return res
+
+    def test_default_none_is_a_plain_shell(self):
+        for name in ("tmux", "btop", "tuios", "zellij"):
+            self.stub_tui(name)
+        res = self.login()
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(self.tui_calls(), [])
+        self.assertNotIn("oma-server:", res.plain)
+
+    def test_shipped_default_is_none(self):
+        self.assertIn('shell = "none"', (ROOT / "config/config.toml").read_text())
+        self.assertIn('shell_command = ""', (ROOT / "config/config.toml").read_text())
+
+    def test_each_value_launches_its_program(self):
+        expected = {"tmux": "tmux new-session -A -s deep", "btop": "btop", "tuios": "tuios",
+                    "zellij": "zellij attach --create deep"}
+        for name, argv in expected.items():
+            with self.subTest(shell=name):
+                self.log.write_text("")
+                self.stub_tui(name)
+                self.write_config(name)
+                res = self.login()
+                self.assertEqual(res.rc, 0, res.plain)
+                self.assertEqual(self.tui_calls(), [argv])
+                self.assertIn(f"Starting {name}", res.plain)
+                self.assertIn("plain shell", res.plain)
+
+    def test_custom_runs_shell_command(self):
+        self.write_config("custom", f"echo custom-ran >> {self.log}")
+        res = self.login()
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(self.tui_calls(), ["custom-ran"])
+
+    def test_custom_without_command_falls_back(self):
+        self.write_config("custom", "")
+        res = self.login()
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertIn("not usable", res.plain)
+
+    def test_missing_binary_falls_back_to_plain_shell(self):
+        for name in ("tmux", "btop", "tuios", "zellij"):
+            with self.subTest(shell=name):
+                self.write_config(name)
+                res = self.login()
+                self.assertEqual(res.rc, 0, res.plain)
+                self.assertIn(f"'{name}' is not installed; staying in the plain shell", res.plain)
+
+    def test_crash_or_quit_returns_to_plain_shell(self):
+        self.stub_tui("btop", rc=3)
+        self.write_config("btop")
+        res = self.login()
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertIn("btop ended with code 3", res.plain)
+        self.assertIn("You are in the plain shell", res.plain)
+
+    def test_any_key_skips(self):
+        self.stub_tui("tmux")
+        self.write_config("tmux")
+        res = self.login(keys="x")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertIn("Skipped tmux", res.plain)
+        self.assertEqual(self.tui_calls(), [])
+
+    def test_noop_off_tty1_over_ssh_nested_or_outside_deep(self):
+        self.stub_tui("tmux")
+        self.write_config("tmux")
+        cases = {
+            "tty2": {"OMA_TEST_TTY": "/dev/tty2"},
+            "pts": {"OMA_TEST_TTY": "/dev/pts/3"},
+            "ssh_connection": {"SSH_CONNECTION": "10.0.0.2 5000 10.0.0.1 22"},
+            "ssh_tty": {"SSH_TTY": "/dev/pts/1"},
+            "nested_tmux": {"TMUX": "/tmp/tmux-1000/default,1,0"},
+            "nested_self": {"OMA_DEEP_SHELL_ACTIVE": "1"},
+        }
+        for label, extra in cases.items():
+            with self.subTest(case=label):
+                res = self.login(extra=extra)
+                self.assertEqual(res.rc, 0, res.plain)
+                self.assertEqual(self.tui_calls(), [], label)
+                self.assertNotIn("oma-server:", res.plain)
+        for state in ("DEEP_ENTERING", "DEEP_EXITING", "DEEP_DEGRADED"):
+            with self.subTest(state=state):
+                self.write_state(state)
+                self.login()
+                self.assertEqual(self.tui_calls(), [])
+        self.state.unlink()
+        self.login()
+        self.assertEqual(self.tui_calls(), [])
+
+    def test_noop_without_a_terminal(self):
+        self.stub_tui("tmux")
+        self.write_config("tmux")
+        res = subprocess.run([str(LAUNCHER), "login"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             env={"PATH": f"{self.stubs}:{self.tools}", "HOME": str(self.home)}, timeout=10)
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(self.tui_calls(), [])
+
+    def test_invalid_value_falls_back(self):
+        for bad in ("byobu", "rm -rf", "TMUX", ""):
+            with self.subTest(value=bad):
+                self.write_config(bad)
+                res = self.login()
+                self.assertEqual(res.rc, 0, res.plain)
+                self.assertEqual(self.tui_calls(), [])
+                if bad:
+                    self.assertIn("not usable", res.plain)
+
+    def test_wait_value_is_validated(self):
+        self.stub_tui("tmux")
+        self.write_config("tmux")
+        marker = self.base / "pwned"
+        res = self.login(extra={"OMA_DEEP_SHELL_WAIT": f"$(touch {marker})"})
+        self.assertFalse(marker.exists())
+        self.assertIn("Starting tmux in 3 s", res.plain)
+
+    def test_byobu_is_not_offered(self):
+        for f in ("libexec/oma-server-deep-shell", "lib/deep.sh", "config/config.toml", "README.md", "bin/oma-server"):
+            self.assertNotIn("byobu", (ROOT / f).read_text(), f)
+
+
+class DeepShellCliTests(DeepSandbox):
+    """oma-server deep-shell [name]: config + managed login-profile block."""
+
+    def profile(self, name=".bash_profile"):
+        return self.home / name
+
+    def test_list_shows_default_none(self):
+        res = self.cli("deep-shell")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertRegex(res.plain, r"\* none\s+plain console")
+        for c in ("tmux", "btop", "tuios", "zellij", "custom"):
+            self.assertIn(c, res.plain)
+
+    def test_set_tmux_adds_block_and_none_removes_it(self):
+        self.profile().write_text("export FOO=1\n")
+        res = self.cli("deep-shell", "tmux")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn('shell = "tmux"', self.cfg.read_text())
+        prof = self.profile().read_text()
+        self.assertIn("# >>> oma-server deep shell >>>", prof)
+        self.assertIn(f'"{ROOT}/libexec/oma-server-deep-shell" login', prof)
+        self.assertIn("/dev/tty1", prof)
+        self.assertTrue(prof.startswith("export FOO=1\n"))
+        # idempotent: setting again keeps exactly one block
+        self.cli("deep-shell", "btop")
+        self.assertEqual(self.profile().read_text().count(">>> oma-server deep shell >>>"), 1)
+        res2 = self.cli("deep-shell", "none")
+        self.assertEqual(res2.returncode, 0, res2.plain)
+        self.assertIn('shell = "none"', self.cfg.read_text())
+        self.assertEqual(self.profile().read_text(), "export FOO=1\n")
+
+    def test_none_by_default_touches_no_profile(self):
+        self.cli("deep-shell", "none")
+        self.assertFalse(self.profile().exists())
+
+    def test_zsh_uses_zprofile(self):
+        res = self.cli("deep-shell", "tuios", extra_env={"SHELL": "/usr/bin/zsh"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("oma-server deep shell", self.profile(".zprofile").read_text())
+        self.assertFalse(self.profile().exists())
+
+    def test_each_supported_value_is_accepted(self):
+        for c in ("tmux", "btop", "tuios", "zellij"):
+            with self.subTest(shell=c):
+                res = self.cli("deep-shell", c)
+                self.assertEqual(res.returncode, 0, res.plain)
+                self.assertIn(f'shell = "{c}"', self.cfg.read_text())
+
+    def test_missing_program_warns_but_sets(self):
+        res = self.cli("deep-shell", "tuios", extra_env={"PATH": f"{self.bin}:/usr/bin:/bin"})
+        if shutil.which("tuios", path="/usr/bin:/bin"):
+            self.skipTest("tuios installed on host")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("not installed yet", res.plain)
+
+    def test_invalid_value_rejected_and_config_unchanged(self):
+        before = self.cfg.read_text()
+        for bad in ("byobu", "bash", "--command"):
+            res = self.cli("deep-shell", bad)
+            self.assertNotEqual(res.returncode, 0, bad)
+            self.assertIn("Unknown deep shell", res.plain)
+        self.assertEqual(self.cfg.read_text(), before)
+        self.assertFalse(self.profile().exists())
+
+    def test_custom_requires_safe_command(self):
+        self.assertNotEqual(self.cli("deep-shell", "custom").returncode, 0)
+        for bad in ('echo "x"', "a\\b", "a\nb"):
+            res = self.cli("deep-shell", "custom", "--command", bad)
+            self.assertNotEqual(res.returncode, 0, bad)
+        self.assertIn('shell = "none"', self.cfg.read_text())
+        res = self.cli("deep-shell", "custom", "--command", "htop -d 20")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn('shell_command = "htop -d 20"', self.cfg.read_text())
+        self.assertIn('shell = "custom"', self.cfg.read_text())
+
+    def test_symlinked_profile_is_refused(self):
+        real = self.base / "real_profile"
+        real.write_text("")
+        self.profile().symlink_to(real)
+        res = self.cli("deep-shell", "tmux")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(real.read_text(), "")
+
+    def test_uninstall_removes_the_block(self):
+        subprocess.run(["bash", str(ROOT / "install.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                       env=self.env(), timeout=60)
+        self.profile().write_text("export FOO=1\n")
+        installed = self.cfg_dir / "bin/oma-server"
+        subprocess.run([str(installed), "deep-shell", "tmux"], capture_output=True, env=self.env(), timeout=30)
+        self.assertIn("oma-server deep shell", self.profile().read_text())
+        res = subprocess.run(["bash", str(ROOT / "uninstall.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, env=self.env(), timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.profile().read_text(), "export FOO=1\n")
+
+
+class ConsoleFixAndHardeningTests(DeepSandbox):
+    """Helper console fix (getty@tty1 + chvt 1), Sam INFO-4/INFO-5, quickshell_strategy honesty."""
+
+    def test_helper_console_fix(self):
+        src = HELPER.read_text()
+        self.assertIn('readonly GETTY_UNIT="getty@tty1.service"', src)
+        dm_stop = src.split("    dm-stop)", 1)[1].split(";;", 1)[0]
+        self.assertLess(dm_stop.index('stop "$DM_UNIT"'), dm_stop.index('start "$GETTY_UNIT"'))
+        self.assertIn("/usr/bin/chvt 1", dm_stop)
+        dm_start = src.split("dm_start() {", 1)[1].split("}", 1)[0]
+        self.assertLess(dm_start.index('stop "$GETTY_UNIT"'), dm_start.index('start "$DM_UNIT"'))
+        dm_restart = src.split("    dm-restart)", 1)[1].split(";;", 1)[0]
+        self.assertLess(dm_restart.index('stop "$GETTY_UNIT"'), dm_restart.index('restart "$DM_UNIT"'))
+        self.assertIn("getty@tty1.service", src.split("set -euo pipefail", 1)[0], "contract comment must list getty@tty1")
+
+    def test_helper_hash_pin_matches_console_fix(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(HELPER.read_bytes()).hexdigest(),
+                         "09700eb01e6df72d82faac3fef73f0a3d49e1f266a36bcad70988c8da7ba4b65")
+
+    def test_allowlist_and_sudoers_unchanged(self):
+        self.assertEqual((ROOT / "templates/sudoers-oma-server-deep").read_text().count("deep-helper "), 9)
+        self.assertNotIn("getty", (ROOT / "templates/sudoers-oma-server-deep").read_text())
+
+    def test_info4_sourced_entry_script_does_not_replace_caller(self):
+        for f in ("bin/oma-server", "uninstall.sh", "hooks/post-boot.d/99-server-profile-check.sh"):
+            line = [l for l in (ROOT / f).read_text().splitlines()[1:] if l.strip() and not l.startswith("#")][0]
+            probe = self.base / "probe.sh"
+            probe.write_text(line + '\necho "flags=$-"\n')
+            sourced = subprocess.run(["bash", "-c", f'source {probe}; echo CALLER-ALIVE'], capture_output=True, text=True, timeout=10)
+            self.assertIn("CALLER-ALIVE", sourced.stdout, f)
+            run = subprocess.run(["bash", str(probe)], capture_output=True, text=True, timeout=10)
+            self.assertRegex(run.stdout, r"flags=\S*p", f"{f}: 'bash file' must re-exec under -p")
+
+    def test_info5_follow_seconds_env_is_validated(self):
+        self.install_helper()
+        marker = self.base / "pwned"
+        res = self.cli("enable", "--deep", extra_env={"OMA_DEEP_FOLLOW_SECONDS": f"a[$(touch {marker})]"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertFalse(marker.exists())
+
+    def test_quickshell_strategy_other_than_sigstop_warns(self):
+        src = self.cfg.read_text().replace('quickshell_strategy = "sigstop"', 'quickshell_strategy = "none"')
+        self.cfg.write_text(src)
+        res = self.cli("diff")
+        self.assertIn('quickshell_strategy = "none" is not supported', res.plain)
+
+    def test_readme_is_honest_about_homelab_panel(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("The panel is a `HOST_LAPTOP` control.", readme)
+        self.assertIn('only "sigstop" is implemented', readme)
+        self.assertNotIn("Primary mode toggle (`Enable Homelab Mode` / `Restore Desktop Mode`)", readme)
+        for img in ("preview.png", "assets/screenshots/03-deep-console-login-crop@2x.png"):
+            self.assertIn(img, readme)
+            self.assertTrue((ROOT / img).is_file(), img)
+        self.assertIn("re-run `oma-server deep-setup`", readme)
 
 
 if __name__ == "__main__":

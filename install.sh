@@ -34,6 +34,7 @@ for req_file in \
     "lib/transition.sh" \
     "lib/deep.sh" \
     "libexec/oma-server-deep-helper" \
+    "libexec/oma-server-deep-shell" \
     "templates/sudoers-oma-server-deep" \
     "config/config.toml" \
     "hooks/post-boot.d/99-server-profile-check.sh" \
@@ -58,6 +59,8 @@ cp -f "$SCRIPT_DIR/lib/ui.sh" \
 # Deep Server Mode sources (user dir only). Nothing root-owned is installed here:
 # the helper and sudoers rule are installed only by the opt-in `oma-server deep-setup`.
 cp -f "$SCRIPT_DIR/libexec/oma-server-deep-helper" "$TARGET_DIR/libexec/"
+cp -f "$SCRIPT_DIR/libexec/oma-server-deep-shell" "$TARGET_DIR/libexec/"
+chmod 0755 "$TARGET_DIR/libexec/oma-server-deep-shell"
 cp -f "$SCRIPT_DIR/templates/sudoers-oma-server-deep" "$TARGET_DIR/templates/"
 chmod 0755 "$TARGET_DIR/libexec/oma-server-deep-helper"
 chmod 0644 "$TARGET_DIR/templates/sudoers-oma-server-deep"

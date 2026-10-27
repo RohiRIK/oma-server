@@ -1,8 +1,9 @@
 #!/usr/bin/env -S bash -p
 # bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
 # Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
-# so exported functions/SHELLOPTS from the caller are dropped here as well.
-[[ $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # uninstall.sh - Safe uninstaller for oma-server on Omarchy Linux systems.
 # Restores HOST_LAPTOP baseline before removing runtime artifacts, hooks, and bar widget.
 set -euo pipefail
@@ -172,6 +173,20 @@ fi
 
 # 5. Remove CLI symlinks, post-boot hook, and runtime directory
 ui_log_info "Removing CLI symlinks from: $BIN_DIR"
+# Remove the opt-in deep console block (`oma-server deep-shell`) from login profiles.
+for prof in "$HOME/.bash_profile" "${ZDOTDIR:-$HOME}/.zprofile"; do
+    [[ -f "$prof" && ! -L "$prof" ]] || continue
+    grep -qF "# >>> oma-server deep shell >>>" "$prof" || continue
+    tmp=$(mktemp "${prof}.XXXXXX")
+    if awk '$0=="# >>> oma-server deep shell >>>"{h=0;s=1;next} $0=="# <<< oma-server deep shell <<<"{s=0;next} s{next} h{print "";h=0} $0==""{h=1;next} {print} END{if(h)print ""}' "$prof" > "$tmp"; then
+        chmod --reference="$prof" "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$prof"
+    else
+        rm -f "$tmp"
+        continue
+    fi
+    ui_log_info "Removed the deep console block from $prof"
+done
 rm -f "$BIN_DIR/oma-server" "$BIN_DIR/omarchy-server-mode"
 
 if [[ -f "$HOOK_FILE" ]]; then

@@ -127,10 +127,10 @@ capture_snapshot() {
         stay_awake_was_active="true"
     fi
 
+    # Only the SIGSTOP strategy is implemented (see resolve_quickshell_strategy in the
+    # CLI, which warns about any other configured value).
     local action_label="SIGSTOP"
-    if [[ "${qs_strategy,,}" != "sigstop" ]]; then
-        action_label="SIGSTOP"
-    fi
+    : "${qs_strategy}"
 
     # Construct canonical JSON snapshot payload
     jq -n \

@@ -135,22 +135,42 @@ polkit.addRule(function(action, subject) {
 `oma-server` ships with a native Quickshell bar widget (`Panel.qml`) featuring a zero-emoji, theme-adaptive telemetry interface:
 
 <p align="center">
-  <img src="preview.png" alt="Oma Server Panel Component Preview" width="85%">
+  <img src="preview.png" alt="Omarchy desktop with the oma-server bar widget popup open in HOST_LAPTOP mode (real VM capture)" width="85%">
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/01c-host-laptop-bar-icon-lit-crop@4x.png" alt="Bar icon lit in HOST_LAPTOP" width="45%">
+  &nbsp;
+  <img src="assets/screenshots/02b-homelab-bar-icon-dimmed-crop@4x.png" alt="Bar icon dimmed in HOMELAB_MODE" width="45%"><br>
+  <sub>Bar icon: lit in <code>HOST_LAPTOP</code> (left), dimmed and frozen in <code>HOMELAB_MODE</code> (right). Real captures.</sub>
 </p>
 
 * **Bar Indicator**: Vector laptop icon whose screen is illuminated (`lit: true`) in `HOST_LAPTOP` mode, dark/off (`lit: false`) in `HOMELAB_MODE` (reflecting DPMS display powerdown), and pulses smoothly during transitions.
 * **Dashboard Popup**:
+
+  <p align="center">
+    <img src="assets/screenshots/01-host-laptop-popup-crop@2x.png" alt="oma-server bar popup in HOST_LAPTOP (real VM capture)" width="404"><br>
+    <sub>The popup in <code>HOST_LAPTOP</code>. Real capture.</sub>
+  </p>
+
   * **Hero Header & Status Pill**: Displays mode icon, active profile title, live session elapsed time, and a semantic status pill (`DESKTOP`, `HOMELAB`, `SYNCING`, `DEGRADED`, `ERROR`).
   * **Animated Progress Track**: Displays a smooth progress bar and live elapsed timer during state transitions.
   * **Subsystem Telemetry**: Clean key-value rows reporting Sleep & Lid Inhibit, Display Output, Shell Event Loop, Auto-Revert Timer, and Protected Services.
   * **Auto-Revert Timer Presets**: One-click timeout presets (`Off`, `30m`, `1h`, `2h`, `4h`).
-  * **Action Controls**: Primary mode toggle (`Enable Homelab Mode` / `Restore Desktop Mode`), `Plan Diff` terminal launcher, `Refresh`, and `Rescue` emergency recovery.
+  * **Action Controls**: `Enable Homelab Mode`, `Plan Diff` terminal launcher, `Refresh`, `Rescue` emergency recovery, and `Set up Deep Server Mode…` / `Deep Server Mode…`.
+
+> **The panel is a `HOST_LAPTOP` control.** `HOMELAB_MODE` pauses Quickshell with `SIGSTOP`, and the bar widget lives inside Quickshell, so while homelab is active the bar is frozen: the dimmed `◆` icon stays visible, but the popup cannot open and there is no clickable "Restore" button. Bring the desktop back with `oma-server disable` (SSH, a TTY, or a terminal keybind), the `--timeout` auto-revert, or `oma-server rescue`. The `Restore Desktop Mode` label only shows up during the brief transition before the freeze, or if the shell was not running when homelab started.
 
 ---
 
 ## CLI Reference
 
 ### 1. Inspect System Telemetry
+
+<p align="center">
+  <img src="assets/screenshots/04a-status-terminal-full.png" alt="oma-server status dashboard in a terminal (real VM capture)" width="85%">
+</p>
+
 ```bash
 # Box-drawn TUI telemetry dashboard
 oma-server status
@@ -193,6 +213,11 @@ Unconditionally unfreezes any stopped Quickshell instances, powers on all displa
 
 ## Deep Server Mode (opt-in)
 
+<p align="center">
+  <img src="assets/screenshots/03-deep-console-login-crop@2x.png" alt="Deep Server Mode screen: plain tty1 text console with a login: prompt (real VM capture)" width="85%"><br>
+  <sub>What the screen shows in <code>DEEP_SERVER</code>: a plain text console on tty1 with a real <code>login:</code> prompt, like Ubuntu Server.</sub>
+</p>
+
 `HOMELAB_MODE` keeps your apps open and only pauses the desktop. **`DEEP_SERVER`** makes the machine behave like a headless Ubuntu server: no compositor, no bar, no GUI apps and no greeter. SSH, networking, docker/containers, agents and `systemd --user` services keep running. One command brings the full Omarchy desktop back through SDDM autologin.
 
 It is **off by default**. A normal `./install.sh` installs nothing root-owned and never turns it on.
@@ -203,8 +228,10 @@ oma-server deep-setup            # shows the files and the sudoers line, asks y/
 oma-server deep-setup --remove   # removes the helper and the sudoers rule again
 ```
 `deep-setup` installs, following the same pattern as Omarchy's own `etc/sudoers.d` rules:
-- `/usr/local/lib/oma-server/deep-helper`: owned by root:root with mode 0755, in a root-owned directory. It only accepts a fixed set of verbs (`check`, `dm-stop`, `dm-start`, `dm-restart`, `inhibit-start`, `inhibit-stop`, `revert-arm <seconds>`, `revert-disarm`, `exit`). It takes no paths, no unit names and no shell input, and it pins `PATH`.
+- `/usr/local/lib/oma-server/deep-helper`: owned by root:root with mode 0755, in a root-owned directory. Its sha256 is pinned in `lib/deep.sh`, and setup refuses a modified copy. It only accepts a fixed set of verbs (`check`, `dm-stop`, `dm-start`, `dm-restart`, `inhibit-start`, `inhibit-stop`, `revert-arm <seconds>`, `revert-disarm`, `exit`). It takes no paths, no unit names and no shell input, and it pins `PATH`.
 - `/etc/sudoers.d/oma-server-deep`: mode 0440. It is checked with `visudo -cf` and then moved into place atomically. It contains a `%wheel NOPASSWD` grant that spells out each of those exact commands. Requires sudo 1.9.10 or newer built with sudoers regex support. Arch/Omarchy has it; on builds without it (Ubuntu's, for example) `visudo -cf` fails and setup installs nothing.
+
+> **Upgrading from an earlier 1.2.0 build:** the helper changed (it now brings up the tty1 console), so its pinned hash changed. Until you re-run `oma-server deep-setup`, `enable --deep` refuses and `status` shows `DEGRADED` / "deep helper missing". Re-running setup replaces the helper; the sudoers rule stays the same.
 
 Because of that grant, any process running as a wheel user can stop and start the desktop without a password. That is a local denial of service, not a privilege escalation. The setup prompt says so before installing.
 
@@ -218,14 +245,37 @@ oma-server disable                              # from SSH or a TTY: brings the 
 ```
 - **Open windows:** the default is to refuse. To close them you need `--close-apps`, an interactive terminal, and the literal word `yes`. `-y` is rejected, and there is no config key that closes apps.
 - **Timer:** created only when you pass `--timeout`. Deep mode ignores `[profile] default_timeout`.
-- **Enter:** `uwsm stop`, then the display manager is stopped. Linger is enabled while in deep mode so user services survive, and a root sleep/lid inhibitor is held.
-- **Exit:** the display manager is started again and SDDM autologin brings Hyprland back. Then the inhibitor and timers are released and linger is restored.
+- **Enter:** `uwsm stop`, then the display manager is stopped. The helper then starts `getty@tty1.service` and switches to tty1 (`chvt 1`), so the screen shows a real `login:` prompt instead of a blank VT. Linger is enabled while in deep mode so user services survive, and a root sleep/lid inhibitor is held.
+- **Exit:** the helper stops `getty@tty1` (so the display manager gets tty1 back), the display manager is started again, and SDDM autologin brings Hyprland back. Then the inhibitor and timers are released and linger is restored.
 - **Not changed:** the default target (`graphical.target`), so a reboot always returns to the desktop.
 - **Terminal agents:** agents started from a GUI terminal die with the session. Run them as `systemd-run --user` units, or in tmux started that way.
 
+### The tty1 console and the optional deep shell
+
+At the machine, log in at the tty1 `login:` prompt with your normal user and password. By default you get a plain shell; run `oma-server disable` to bring the desktop back.
+
+You can opt in to a TUI that starts after that login. It is configured as `[deep] shell` (default `"none"`) and set with:
+
+```bash
+oma-server deep-shell                 # show the current choice and which programs are installed
+oma-server deep-shell none            # default: plain console + login: prompt, no profile edits
+oma-server deep-shell tmux            # tmux new-session -A -s deep (SSH can `tmux attach -t deep`)
+oma-server deep-shell btop            # system monitor
+oma-server deep-shell tuios           # advanced: terminal window manager
+oma-server deep-shell custom --command "htop -d 20"   # runs [deep] shell_command via bash -c
+```
+
+`zellij` also works (`zellij attach --create deep`).
+
+- **Where it runs:** only for an interactive login on **tty1** while the state is `DEEP_SERVER`. SSH logins, other TTYs, a tty1 login outside deep mode, and nested sessions are never affected.
+- **How:** any choice other than `none` adds a small marked block to `~/.bash_profile` (or `~/.zprofile` for zsh) that calls `libexec/oma-server-deep-shell login`. `deep-shell none` and `uninstall.sh` remove that block. fish users add the line by hand: `if test (tty) = /dev/tty1; ~/.config/omarchy/plugins/server-mode/libexec/oma-server-deep-shell login; end`.
+- **Escape hatch:** after login it waits 3 s; press any key to skip the TUI for that login.
+- **Fallback:** the program runs as a child of your login shell, never `exec`. If it is missing, crashes or you quit it, you land in the plain shell. An unknown value also falls back to the plain shell.
+- Runs as your user only: no root, and no sudoers change.
+
 ### Getting back without a bar
 1. Over SSH: `oma-server disable`.
-2. At the machine: Ctrl+Alt+F2, log in, then `oma-server disable`.
+2. At the machine: log in at the tty1 `login:` prompt (or Ctrl+Alt+F2), then `oma-server disable`.
 3. Reboot or long-press power. Autologin brings the desktop back and the post-boot hook clears the deep-mode state.
 4. Panic command: `sudo systemctl start display-manager`.
 
@@ -242,7 +292,7 @@ Configured via `~/.config/omarchy/plugins/server-mode/config.toml`:
 default_mode = "host"
 dpms_off_on_enable = true
 auto_wake_on_input = true
-quickshell_strategy = "sigstop"
+quickshell_strategy = "sigstop"    # only "sigstop" is implemented; other values warn and fall back
 default_timeout = "0"              # "0" = manual restore, or e.g. "45m", "2h"
 
 [inhibit]
@@ -263,6 +313,23 @@ services = [
   "pipewire.service",
   "wireplumber.service"
 ]
+
+[deep]
+# Deep Server Mode (opt-in): stops Hyprland and the display manager, keeps SSH/docker/user services.
+# `oma-server deep-setup` flips `allowed` to true; `enable --deep` refuses while it is false.
+# There is deliberately no key to close apps or to force a timeout.
+allowed = false
+stop_display_manager = true
+exit_wait_seconds = 45             # how long `disable` waits for Hyprland to come back
+job_wait_seconds = 180             # if uwsm refuses to stop because a user start job is queued, wait this long (0-600) for the queue to drain, then retry once
+require_ssh = true                 # refuse unless sshd.service is active
+# Console on tty1 while in Deep Server Mode. "none" (default) = plain text console with a
+# `login:` prompt, like Ubuntu Server. Opt in with `oma-server deep-shell <name>`:
+# tmux | btop | tuios (advanced) | custom (runs shell_command); zellij also works.
+# Only an interactive login on tty1 is affected (never SSH); any key within 3 s skips it,
+# and quitting, a crash or a missing program leaves you in the plain shell.
+shell = "none"
+shell_command = ""
 ```
 
 ---

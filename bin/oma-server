@@ -2,8 +2,9 @@
 # bash -p: privileged mode never imports exported functions (BASH_FUNC_*%%), BASH_ENV,
 # ENV or SHELLOPTS from the caller, so nothing can shadow sudo/type/realpath here.
 # Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
-# so exported functions/SHELLOPTS from the caller are dropped here as well.
-[[ $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # ~/.config/omarchy/plugins/server-mode/bin/omarchy-server-mode
 # Enterprise CLI coordinator for oma-server (Omarchy Server-Mode)
 set -euo pipefail
@@ -56,6 +57,18 @@ LOCK_FILE="$RUN_DIR/lock"
 deep_reconcile_boot || true
 
 # Deep Server Mode status (DEEP_ENTERING / DEEP_SERVER / DEEP_EXITING / DEEP_DEGRADED)
+# [profile] quickshell_strategy: only "sigstop" is implemented (lib/snapshot.sh and
+# lib/transition.sh always pause the shell with SIGSTOP). Say so instead of silently
+# ignoring another value.
+resolve_quickshell_strategy() {
+    local s
+    s="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+    if [[ "${s,,}" != "sigstop" ]]; then
+        ui_log_warn "[profile] quickshell_strategy = \"${s}\" is not supported; using \"sigstop\" (the only implemented strategy)." >&2
+    fi
+    printf "sigstop"
+}
+
 deep_status() {
     local as_json="$1"
     local state entered now elapsed tlabel tepoch timeout_status="Disabled (no --timeout)" health="OK"
@@ -311,6 +324,7 @@ print_usage() {
     ui_box_line "$w" "$(printf "    %-24s %s" "rescue" "Force emergency recovery to safe baseline")"
     ui_box_line "$w" "$(printf "    %-24s %s" "deep-setup [--remove]" "Opt-in: install/remove Deep Server root helper")"
     ui_box_line "$w" "$(printf "    %-24s %s" "diff --deep" "Show the Deep Server plan (windows, units)")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "deep-shell [name]" "Deep console: none|tmux|btop|tuios|zellij|custom")"
     printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
     ui_box_line "$w" "  ${UI_BOLD}${UI_MUTED}ENABLE OPTIONS:${UI_RESET}"
     ui_box_line "$w" "$(printf "    %-24s %s" "--dry-run" "Simulate transition in memory without changes")"
@@ -388,7 +402,7 @@ case "$cmd" in
             ui_log_fail "Unexpected argument '$1' for 'diff' command." "Run '$CMD_NAME diff' with no arguments."
             exit 1
         fi
-        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        qs_strategy="$(resolve_quickshell_strategy)"
         snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
         mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
         ui_render_diff_panel "$snapshot_in_memory" "" "${services[@]}"
@@ -489,7 +503,7 @@ case "$cmd" in
             exit 0
         fi
 
-        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        qs_strategy="$(resolve_quickshell_strategy)"
         snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
         mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
 
@@ -645,6 +659,12 @@ case "$cmd" in
                 exit 1
                 ;;
         esac
+        ;;
+
+    deep-shell)
+        shift || true
+        deep_shell_cmd "$PLUGIN_ROOT" "$USER_CONFIG_FILE" "$@"
+        exit $?
         ;;
 
     __deep-enter-worker)
