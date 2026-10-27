@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1939,7 +1940,7 @@ class ConsoleFixAndHardeningTests(DeepSandbox):
     def test_helper_hash_pin_matches_console_fix(self):
         import hashlib
         self.assertEqual(hashlib.sha256(HELPER.read_bytes()).hexdigest(),
-                         "09700eb01e6df72d82faac3fef73f0a3d49e1f266a36bcad70988c8da7ba4b65")
+                         "cc3309fdf39ae83d402b52cdd2f87a13fdc4f995efd38c1477de688c8df5a989")
 
     def test_allowlist_and_sudoers_unchanged(self):
         self.assertEqual((ROOT / "templates/sudoers-oma-server-deep").read_text().count("deep-helper "), 9)
@@ -1977,6 +1978,217 @@ class ConsoleFixAndHardeningTests(DeepSandbox):
             self.assertIn(img, readme)
             self.assertTrue((ROOT / img).is_file(), img)
         self.assertIn("re-run `oma-server deep-setup`", readme)
+
+
+class SixthPassTests(DeepSandbox):
+    """Sam re-review @ 80f5a9e: L1 detached exit on tty1, L2 unterminated block, INFO-6/7/8, temp-file traps."""
+
+    BEGIN = "# >>> oma-server deep shell >>>"
+    END = "# <<< oma-server deep shell <<<"
+
+    def profile(self, name=".bash_profile"):
+        return self.home / name
+
+    def on_tty1(self):
+        write_executable(self.bin / "tty", "#!/usr/bin/env bash\necho /dev/tty1\n")
+
+    def exit_runs(self):
+        return [c for c in self.calls() if c.startswith("systemd-run --user") and "--unit=oma-server-deep-exit" in c]
+
+    def ready_to_exit(self, **state):
+        self.install_helper()
+        self.write_deep_state(**state)
+        self.enter_desktop_down()
+
+    # ---- L1 ----
+    def test_l1_helper_ignores_hup_before_any_privileged_call(self):
+        src = HELPER.read_text()
+        body = src.split("set -euo pipefail", 1)[1]
+        self.assertIn("trap '' HUP", body)
+        first_cmd = min(body.index(x) for x in ('"$SYSTEMCTL"', "$SYSTEMCTL ", "/usr/bin/chvt") if x in body)
+        self.assertLess(body.index("trap '' HUP"), first_cmd)
+        self.assertLess(body.index("trap '' HUP"), body.index("readonly SYSTEMCTL"))
+
+    def test_l1_helper_survives_sighup(self):
+        # The helper shape (set -euo + trap '' HUP) keeps running when HUP arrives.
+        prelude = HELPER.read_text().split("PATH=", 1)[0]
+        script = prelude + 'kill -HUP $$\nsleep 0.1\necho survived\n'
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.stdout.strip(), "survived", res.stderr)
+
+    def test_l1_disable_on_tty1_runs_detached(self):
+        self.ready_to_exit(timeout_seconds=120)
+        self.on_tty1()
+        res = self.cli_tty("disable")
+        self.assertEqual(res.rc, 0, res.plain)
+        runs = self.exit_runs()
+        self.assertEqual(len(runs), 1, self.calls())
+        self.assertTrue(runs[0].endswith("__deep-exit-worker"), runs[0])
+        self.assertIn("--setenv=OMA_SERVER_TEST_ROOT=", runs[0])
+        calls = self.calls()
+        i_run = calls.index(runs[0])
+        i_dm = next(i for i, c in enumerate(calls) if c.endswith("deep-helper dm-start"))
+        self.assertLess(i_run, i_dm, "the exit sequence must run inside the detached unit")
+        self.assertIn("detached unit", res.plain)
+        self.assertIn("Desktop restored", res.plain)
+        self.assertIsNone(self.deep_state())
+        self.assertEqual(self.last_deep()["result"], "exited")
+        self.assertTrue(self.is_active("sys", "display-manager.service"))
+
+    def test_l1_inside_deep_shell_runs_detached(self):
+        self.ready_to_exit()
+        res = self.cli("disable", extra_env={"OMA_DEEP_SHELL_ACTIVE": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(len(self.exit_runs()), 1)
+        self.assertIsNone(self.deep_state())
+
+    def test_l1_off_console_stays_in_foreground(self):
+        self.ready_to_exit()
+        res = self.cli_tty("disable")        # a pty, not tty1
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(self.exit_runs(), [])
+        self.assertIsNone(self.deep_state())
+
+    def test_l1_auto_timeout_stays_in_foreground_even_on_tty1(self):
+        self.ready_to_exit(timeout_seconds=120)
+        self.on_tty1()
+        res = self.cli_tty("disable", "--auto-timeout")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(self.exit_runs(), [])
+
+    def test_l1_systemd_run_failure_falls_back_to_foreground(self):
+        self.ready_to_exit()
+        res = self.cli("disable", extra_env={"OMA_DEEP_SHELL_ACTIVE": "1", "OMA_TEST_SYSTEMD_RUN_FAIL": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("running in the foreground", res.plain)
+        self.assertIsNone(self.deep_state())
+
+    def test_l1_detached_failure_reports_degraded(self):
+        self.ready_to_exit()
+        (self.s / "autologin_works").unlink()
+        res = self.cli("disable", extra_env={"OMA_DEEP_SHELL_ACTIVE": "1"})
+        self.assertEqual(res.returncode, 1, res.plain)
+        self.assertIn("Desktop did not come back", res.plain)
+        self.assertEqual(self.deep_state()["state"], "DEEP_DEGRADED")
+        self.assertTrue((self.s / "inhibit").exists())
+
+    def test_l1_rescue_on_tty1_runs_exit_detached(self):
+        self.ready_to_exit()
+        self.on_tty1()
+        res = self.cli_tty("rescue")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(len(self.exit_runs()), 1)
+        self.assertIsNone(self.deep_state())
+
+    # ---- L2 ----
+    def sam_profile(self):
+        text = f"a\n{self.BEGIN}\nx\nuser-line-after\n"
+        self.profile().write_text(text)
+        return text
+
+    def test_l2_unterminated_block_is_left_untouched_by_deep_shell(self):
+        text = self.sam_profile()
+        for choice in ("none", "tmux"):
+            with self.subTest(choice=choice):
+                res = self.cli("deep-shell", choice)
+                self.assertNotEqual(res.returncode, 0, res.plain)
+                self.assertIn("without a matching end marker", res.plain)
+                self.assertEqual(self.profile().read_text(), text)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir() if p.name.startswith(".bash_profile")),
+                         [".bash_profile"])
+
+    def test_l2_unterminated_block_is_left_untouched_by_uninstall(self):
+        text = self.sam_profile()
+        res = subprocess.run(["bash", str(ROOT / "uninstall.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, env=self.env(), timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("without a matching end marker", ANSI_RE.sub("", res.stdout + res.stderr))
+        self.assertEqual(self.profile().read_text(), text)
+
+    def test_l2_stray_end_or_nested_begin_is_refused(self):
+        for text in (f"a\n{self.END}\n{self.BEGIN}\nb\n", f"{self.BEGIN}\n{self.BEGIN}\n{self.END}\nkeep\n"):
+            with self.subTest(text=text):
+                self.profile().write_text(text)
+                self.assertNotEqual(self.cli("deep-shell", "none").returncode, 0)
+                self.assertEqual(self.profile().read_text(), text)
+
+    def test_l2_wellformed_block_still_removed(self):
+        self.profile().write_text(f"a\n\n{self.BEGIN}\nx\n{self.END}\nuser-line-after\n")
+        res = self.cli("deep-shell", "none")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.profile().read_text(), "a\nuser-line-after\n")
+
+    # ---- INFO-6 / INFO-7 / INFO-8 ----
+    def test_info6_config_mode_is_preserved(self):
+        os.chmod(self.cfg, 0o600)
+        self.assertEqual(self.cli("deep-shell", "custom", "--command", "htop").returncode, 0)
+        self.assertEqual(stat.S_IMODE(self.cfg.stat().st_mode), 0o600)
+        os.chmod(self.cfg, 0o640)
+        self.assertEqual(self.cli("deep-shell", "none").returncode, 0)
+        self.assertEqual(stat.S_IMODE(self.cfg.stat().st_mode), 0o640)
+
+    def test_info7_symlinked_profile_with_block_is_refused_by_none(self):
+        real = self.base / "dotfiles_profile"
+        text = f"a\n{self.BEGIN}\nx\n{self.END}\n"
+        real.write_text(text)
+        self.profile().symlink_to(real)
+        res = self.cli("deep-shell", "none")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("symlink", res.plain)
+        self.assertTrue(self.profile().is_symlink())
+        self.assertEqual(real.read_text(), text)
+
+    def test_info8_new_bash_profile_sources_profile_first(self):
+        self.assertFalse(self.profile().exists())
+        self.assertEqual(self.cli("deep-shell", "tmux").returncode, 0)
+        lines = self.profile().read_text().splitlines()
+        self.assertEqual(lines[1], '[ -f "$HOME/.profile" ] && . "$HOME/.profile"')
+        self.assertLess(1, lines.index(self.BEGIN))
+        # the source line survives removing the block
+        self.assertEqual(self.cli("deep-shell", "none").returncode, 0)
+        self.assertIn('. "$HOME/.profile"', self.profile().read_text())
+        self.assertNotIn(self.BEGIN, self.profile().read_text())
+        # and it really runs ~/.profile in a bash login shell
+        (self.home / ".profile").write_text(f'touch "{self.base}/profile-ran"\n')
+        subprocess.run(["bash", "-lc", "true"], env=self.env(), capture_output=True, timeout=10)
+        self.assertTrue((self.base / "profile-ran").exists())
+
+    def test_info8_existing_profile_and_zprofile_get_no_source_line(self):
+        self.profile().write_text("export FOO=1\n")
+        self.cli("deep-shell", "tmux")
+        self.assertNotIn(".profile\"", self.profile().read_text())
+        self.cli("deep-shell", "btop", extra_env={"SHELL": "/usr/bin/zsh"})
+        self.assertNotIn(".profile\"", self.profile(".zprofile").read_text())
+
+    # ---- temp-file cleanup on signals ----
+    def awk_killer(self, marker):
+        write_executable(self.bin / "awk", f"""#!/usr/bin/env bash
+if [[ "$*" == *"{marker}"* ]]; then kill -TERM "$PPID"; /usr/bin/awk "$@"; exit $?; fi
+exec /usr/bin/awk "$@"
+""")
+
+    def test_signal_during_config_rewrite_removes_temp_file(self):
+        self.awk_killer("function emit")
+        before = self.cfg.read_text()
+        res = self.cli("deep-shell", "tmux")
+        self.assertEqual(res.returncode, -signal.SIGTERM, res.plain)
+        self.assertEqual([p.name for p in self.cfg_dir.iterdir() if p.name.startswith("config.toml.")], [])
+        self.assertEqual(self.cfg.read_text(), before)
+
+    def test_signal_during_profile_rewrite_removes_temp_file(self):
+        self.profile().write_text(f"a\n{self.BEGIN}\nx\n{self.END}\n")
+        self.awk_killer("held { print")
+        res = self.cli("deep-shell", "none")
+        self.assertEqual(res.returncode, -signal.SIGTERM, res.plain)
+        self.assertEqual([p.name for p in self.home.iterdir() if p.name.startswith(".bash_profile.")], [])
+
+    def test_signal_during_uninstall_rewrite_removes_temp_file(self):
+        self.profile().write_text(f"a\n{self.BEGIN}\nx\n{self.END}\n")
+        self.awk_killer("h{print")
+        res = subprocess.run(["bash", str(ROOT / "uninstall.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, env=self.env(), timeout=60)
+        self.assertEqual(res.returncode, -signal.SIGTERM, res.stdout + res.stderr)
+        self.assertEqual([p.name for p in self.home.iterdir() if p.name.startswith(".bash_profile.")], [])
 
 
 if __name__ == "__main__":

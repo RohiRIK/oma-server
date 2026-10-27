@@ -586,7 +586,7 @@ case "$cmd" in
         if deep_state_exists; then
             deep_rc=0
             deep_from="$(deep_state_get state DEEP_SERVER)"
-            deep_exit_transaction "$CONFIG_FILE" "$is_auto_timeout" || deep_rc=$?
+            deep_exit_run "$CONFIG_FILE" "$is_auto_timeout" "$REAL_SCRIPT" || deep_rc=$?
             if (( deep_rc == 0 )); then
                 ui_log_ok "Desktop restored: ${deep_from} -> HOST_LAPTOP."
             fi
@@ -633,7 +633,7 @@ case "$cmd" in
         shift || true
         op_start_ms="$(ui_now_ms)"
         if deep_state_exists; then
-            deep_exit_transaction "$CONFIG_FILE" "false" || \
+            deep_exit_run "$CONFIG_FILE" "false" "$REAL_SCRIPT" || \
                 ui_log_warn "Deep Server exit did not complete." "Panic: ${DEEP_PANIC_HINT}"
         fi
         force_rescue_mode "$RUN_DIR" "$SNAPSHOT_FILE"
@@ -669,6 +669,12 @@ case "$cmd" in
 
     __deep-enter-worker)
         deep_enter_worker "$CONFIG_FILE" "$REAL_SCRIPT"
+        exit $?
+        ;;
+
+    __deep-exit-worker)
+        # L1: started by deep_exit_run via systemd-run --user when disable/rescue ran on tty1.
+        deep_exit_transaction "$CONFIG_FILE" "false"
         exit $?
         ;;
 

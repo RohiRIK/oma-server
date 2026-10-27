@@ -252,7 +252,7 @@ oma-server disable                              # from SSH or a TTY: brings the 
 
 ### The tty1 console and the optional deep shell
 
-At the machine, log in at the tty1 `login:` prompt with your normal user and password. By default you get a plain shell; run `oma-server disable` to bring the desktop back.
+At the machine, log in at the tty1 `login:` prompt with your normal user and password. By default you get a plain shell; run `oma-server disable` to bring the desktop back. On tty1 (or inside the deep shell), `disable` and `rescue` hand the exit sequence to a detached `systemd-run --user` unit (`oma-server-deep-exit`), because bringing the display manager back stops `getty@tty1` and hangs up that console; the helper also ignores `SIGHUP`.
 
 You can opt in to a TUI that starts after that login. It is configured as `[deep] shell` (default `"none"`) and set with:
 

@@ -11,10 +11,15 @@
 #     5..604920, revalidated here even though sudoers also pins the shape).
 #   * No user-controlled paths, unit names, environment, or shell evaluation.
 #   * PATH is pinned to system directories and only absolute binaries are run.
+#   * Ignores SIGHUP (stopping getty@tty1 hangs up a tty1 caller).
 #   * Touches only display-manager.service, getty@tty1.service (so deep mode shows a
 #     real text console with a `login:` prompt), oma-server-deep-inhibit.service and
 #     oma-server-deep-revert.timer/.service.
 set -euo pipefail
+# L1: leaving deep mode stops getty@tty1, which hangs up tty1. When the CLI runs there,
+# sudo relays that SIGHUP; ignore it so dm-start/dm-restart never die between
+# "stop getty" and "start the display manager".
+trap '' HUP
 PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
 export PATH
 umask 022

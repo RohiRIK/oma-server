@@ -174,19 +174,35 @@ fi
 # 5. Remove CLI symlinks, post-boot hook, and runtime directory
 ui_log_info "Removing CLI symlinks from: $BIN_DIR"
 # Remove the opt-in deep console block (`oma-server deep-shell`) from login profiles.
+# An interrupted rewrite never leaves its temp file behind.
+UNINSTALL_TMP=""
+for sig in INT TERM HUP; do
+    # shellcheck disable=SC2064  # expand $sig now; $UNINSTALL_TMP at signal time
+    trap "[[ -n \"\$UNINSTALL_TMP\" ]] && rm -f -- \"\$UNINSTALL_TMP\"; trap - $sig; kill -s $sig \$\$" "$sig"
+done
 for prof in "$HOME/.bash_profile" "${ZDOTDIR:-$HOME}/.zprofile"; do
     [[ -f "$prof" && ! -L "$prof" ]] || continue
     grep -qF "# >>> oma-server deep shell >>>" "$prof" || continue
+    # L2: rewrite only when every begin marker is followed by its end marker; a
+    # hand-edited, unterminated block would otherwise truncate the profile to EOF.
+    if ! awk '$0=="# >>> oma-server deep shell >>>"{if(o)bad=1;o=1;n++;next} $0=="# <<< oma-server deep shell <<<"{if(!o)bad=1;o=0;next} END{exit (bad||o||n==0)?1:0}' "$prof"; then
+        ui_log_warn "$prof has an oma-server deep shell block without a matching end marker; left it untouched. Remove it by hand."
+        continue
+    fi
     tmp=$(mktemp "${prof}.XXXXXX")
+    UNINSTALL_TMP="$tmp"
     if awk '$0=="# >>> oma-server deep shell >>>"{h=0;s=1;next} $0=="# <<< oma-server deep shell <<<"{s=0;next} s{next} h{print "";h=0} $0==""{h=1;next} {print} END{if(h)print ""}' "$prof" > "$tmp"; then
         chmod --reference="$prof" "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$prof"
+        mv -f "$tmp" "$prof" || rm -f "$tmp"
+        UNINSTALL_TMP=""
     else
         rm -f "$tmp"
+        UNINSTALL_TMP=""
         continue
     fi
     ui_log_info "Removed the deep console block from $prof"
 done
+trap - INT TERM HUP
 rm -f "$BIN_DIR/oma-server" "$BIN_DIR/omarchy-server-mode"
 
 if [[ -f "$HOOK_FILE" ]]; then

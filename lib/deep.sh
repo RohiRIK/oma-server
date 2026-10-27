@@ -56,11 +56,13 @@ DEEP_LOCK_FILE="$DEEP_STATE_DIR/deep.lock"
 DEEP_SESSION_UNIT="wayland-wm@hyprland.desktop.service"
 DEEP_TRANSITION_UNIT="oma-server-deep-transition"
 DEEP_USER_TIMER_UNIT="oma-server-timer"
+# L1: exit worker unit, used when `disable`/`rescue` runs on the tty1 console.
+DEEP_EXIT_UNIT="oma-server-deep-exit"
 DEEP_POLL="${OMA_DEEP_POLL_INTERVAL:-1}"
 DEEP_PANIC_HINT="sudo systemctl start display-manager"
 # S2: the helper source is pinned by hash (test/deep.test.py keeps this in sync);
 # the sudoers rule is generated here, never trusted from the user-writable plugin dir.
-DEEP_HELPER_SHA256="09700eb01e6df72d82faac3fef73f0a3d49e1f266a36bcad70988c8da7ba4b65"
+DEEP_HELPER_SHA256="cc3309fdf39ae83d402b52cdd2f87a13fdc4f995efd38c1477de688c8df5a989"
 DEEP_HELPER_VERBS=(check dm-stop dm-start dm-restart inhibit-start inhibit-stop revert-disarm exit)
 
 # Prints the exact sudoers file deep-setup installs.
@@ -532,16 +534,9 @@ deep_enter_transaction() {
         }')" || return 1
 
     # Detach the rest: a terminal inside Hyprland dies when the session stops.
-    local -a setenv=()
-    local var
-    local -a fwd=(HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY OMARCHY_PATH XDG_STATE_HOME XDG_CONFIG_HOME OMA_DEEP_POLL_INTERVAL)
-    # The test-only prefix is forwarded only in test mode (S1).
-    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)
-    for var in "${fwd[@]}"; do
-        [[ -n "${!var:-}" ]] && setenv+=("--setenv=${var}=${!var}")
-    done
+    deep_transition_setenv
     systemctl --user reset-failed "${DEEP_TRANSITION_UNIT}.service" >/dev/null 2>&1 || true
-    if ! systemd-run --user --unit="$DEEP_TRANSITION_UNIT" --collect --quiet "${setenv[@]}" \
+    if ! systemd-run --user --unit="$DEEP_TRANSITION_UNIT" --collect --quiet "${DEEP_SETENV[@]}" \
             "$self_bin" __deep-enter-worker >/dev/null 2>&1; then
         rm -f "$DEEP_STATE_FILE"
         ui_log_fail "Could not start the detached deep-mode transition (systemd-run --user failed)." "Nothing was changed."
@@ -549,6 +544,19 @@ deep_enter_transaction() {
     fi
 
     deep_follow_enter "$config_file"
+}
+
+# Fills DEEP_SETENV with the --setenv= flags a detached worker unit needs.
+deep_transition_setenv() {
+    DEEP_SETENV=()
+    local var
+    local -a fwd=(HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY OMARCHY_PATH XDG_STATE_HOME XDG_CONFIG_HOME OMA_DEEP_POLL_INTERVAL)
+    # The test-only prefix is forwarded only in test mode (S1).
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)
+    for var in "${fwd[@]}"; do
+        [[ -n "${!var:-}" ]] && DEEP_SETENV+=("--setenv=${var}=${!var}")
+    done
+    return 0
 }
 
 # N2: the follower must outlast the longest legitimate enter: the queued-job wait,
@@ -937,6 +945,90 @@ deep_exit_transaction() {
     return 0
 }
 
+# L1: true when this CLI runs on the tty1 console (the deep-mode login console) or
+# inside the deep shell. Leaving deep mode stops getty@tty1, which hangs up tty1 and
+# would SIGHUP a foreground exit sequence between "stop getty" and "start DM".
+deep_on_console() {
+    [[ -n "${OMA_DEEP_SHELL_ACTIVE:-}" ]] && return 0
+    local fd t
+    for fd in 0 1 2; do
+        [[ -t "$fd" ]] || continue
+        t=$(tty <&"$fd" 2>/dev/null) || continue
+        [[ "$t" == /dev/tty1 ]] && return 0
+    done
+    return 1
+}
+
+deep_exit_unit_running() {
+    case "$(systemctl --user is-active "${DEEP_EXIT_UNIT}.service" 2>/dev/null)" in
+        active|activating|deactivating|reloading) return 0 ;;
+    esac
+    return 1
+}
+
+# deep_exit_run <config> <is_auto_timeout> <self_bin>: the exit sequence, run detached
+# (systemd-run --user, like enter) when invoked from the tty1 console, otherwise in
+# the foreground. Same return codes as deep_exit_transaction.
+deep_exit_run() {
+    local config_file="$1" is_auto="${2:-false}" self_bin="$3"
+    if [[ "$is_auto" == "true" ]] || ! deep_on_console; then
+        deep_exit_transaction "$config_file" "$is_auto"
+        return
+    fi
+    deep_state_read >/dev/null || { ui_log_info "No Deep Server state."; return 0; }
+    deep_transition_setenv
+    systemctl --user reset-failed "${DEEP_EXIT_UNIT}.service" >/dev/null 2>&1 || true
+    ui_log_info "On the tty1 console: restoring the desktop from a detached unit (${DEEP_EXIT_UNIT}); this console will be replaced by the desktop."
+    if ! systemd-run --user --unit="$DEEP_EXIT_UNIT" --collect --quiet "${DEEP_SETENV[@]}" \
+            "$self_bin" __deep-exit-worker >/dev/null 2>&1; then
+        # Fallback: the helper ignores SIGHUP, so the foreground sequence still finishes.
+        ui_log_warn "Could not start the detached exit unit (systemd-run --user failed); running in the foreground."
+        deep_exit_transaction "$config_file" "false"
+        return
+    fi
+    deep_follow_exit "$config_file"
+}
+
+# Tails deep.log until the detached exit worker finishes. 0 = back, 1 = failed,
+# 4 = still running at the deadline.
+deep_follow_exit() {
+    local config_file="${1:-}" exit_wait follow_max
+    follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}"
+    if ! [[ "$follow_max" =~ ^[0-9]+$ ]]; then
+        exit_wait=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
+        [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )) || exit_wait=45
+        follow_max=$(( 2 * exit_wait + 60 ))
+    fi
+    local deadline=$(( $(date +%s) + follow_max ))
+    local printed=0 total line result
+    while :; do
+        if [[ -f "$DEEP_LOG_FILE" ]]; then
+            total=$(wc -l < "$DEEP_LOG_FILE")
+            if (( total > printed )); then
+                while IFS= read -r line; do
+                    printf "  %s %s\n" "$(ui_badge_sync)" "${line#* }"
+                done < <(tail -n +"$(( printed + 1 ))" "$DEEP_LOG_FILE" | head -n "$(( total - printed ))")
+                printed=$total
+            fi
+        fi
+        if ! deep_state_exists; then
+            result=$(jq -r '.result // ""' "$DEEP_LAST_FILE" 2>/dev/null || true)
+            [[ "$result" == greeter ]] && ui_log_info "Display manager is up without autologin: log in at the screen."
+            return 0
+        fi
+        if ! deep_exit_unit_running && ! deep_lock_held; then
+            ui_log_fail "Desktop did not come back (state: $(deep_state_get state "?"))." \
+                "Run 'oma-server disable' again, or ${DEEP_PANIC_HINT}. Log: ${DEEP_LOG_FILE}"
+            return 1
+        fi
+        if (( $(date +%s) >= deadline )); then
+            ui_log_warn "Exit still running in the background." "Follow it with: tail -f ${DEEP_LOG_FILE}"
+            return 4
+        fi
+        sleep "$DEEP_POLL"
+    done
+}
+
 # Called at CLI start: a reboot means the desktop is already back.
 deep_reconcile_boot() {
     deep_state_exists || return 0
@@ -1222,11 +1314,42 @@ deep_shell_binary() {
     esac
 }
 
+# Temp files of the in-progress rewrite; removed if a signal interrupts it.
+DEEP_TMP_FILES=()
+_deep_tmp_on_signal() {
+    rm -f -- "${DEEP_TMP_FILES[@]}"
+    DEEP_TMP_FILES=()
+    trap - "$1"
+    kill -s "$1" "$$"
+}
+# deep_tmp_guard <tmp>: register a temp file and arm INT/TERM/HUP cleanup.
+deep_tmp_guard() {
+    DEEP_TMP_FILES+=("$1")
+    trap '_deep_tmp_on_signal INT' INT
+    trap '_deep_tmp_on_signal TERM' TERM
+    trap '_deep_tmp_on_signal HUP' HUP
+}
+# deep_tmp_release: forget the temp files and restore default signal handling.
+deep_tmp_release() {
+    DEEP_TMP_FILES=()
+    trap - INT TERM HUP
+}
+
+# L2: true only when every BEGIN marker is followed by its END marker (no nesting,
+# no stray END). Anything else is left alone, never truncated to EOF.
+deep_shell_block_wellformed() {
+    awk -v b="$DEEP_SHELL_BEGIN" -v e="$DEEP_SHELL_END" '
+        $0==b { if (open) bad=1; open=1; n++; next }
+        $0==e { if (!open) bad=1; open=0; next }
+        END { exit (bad || open || n == 0) ? 1 : 0 }' "$1"
+}
+
 # Sets or adds `key = "value"` inside [deep] (atomic rewrite, keeps comments).
 deep_config_set_string() {
     local file="$1" key="$2" val="$3" tmp
     [[ -f "$file" && ! -L "$file" ]] || { ui_log_fail "Config '$file' missing or a symlink."; return 1; }
     tmp=$(mktemp "${file}.XXXXXX") || return 1
+    deep_tmp_guard "$tmp"
     awk -v k="$key" -v v="$val" '
         function emit() { printf "%s = \"%s\"\n", k, v; done=1 }
         /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
@@ -1236,24 +1359,40 @@ deep_config_set_string() {
         in_sec && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { if (!done) emit(); next }
         { print }
         END { if (!done) { if (!in_sec) print "\n[deep]"; emit() } }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    if ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$file"; then
-        rm -f "$tmp"; return 1
+    ' "$file" > "$tmp" || { rm -f "$tmp"; deep_tmp_release; return 1; }
+    # INFO-6: keep the user's mode (e.g. 0600 when shell_command holds a secret).
+    if ! chmod --reference="$file" "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"; deep_tmp_release; return 1
     fi
+    deep_tmp_release
 }
 
 deep_shell_profile_remove() {
     local prof="$1" tmp
+    # INFO-7: never replace a (dotfiles) symlink with a regular file.
+    if [[ -L "$prof" ]]; then
+        ui_log_fail "'$prof' is a symlink; edit the oma-server deep shell block by hand."
+        return 1
+    fi
     [[ -f "$prof" ]] || return 0
     grep -qF "$DEEP_SHELL_BEGIN" "$prof" || return 0
+    if ! deep_shell_block_wellformed "$prof"; then
+        ui_log_warn "'$prof' has an oma-server deep shell block without a matching end marker; left it untouched." \
+            "Fix or remove the block by hand (from '$DEEP_SHELL_BEGIN' to '$DEEP_SHELL_END')."
+        return 1
+    fi
     tmp=$(mktemp "${prof}.XXXXXX") || return 1
+    deep_tmp_guard "$tmp"
     # Drop the block and the one blank line deep_shell_profile_add put before it.
     awk -v b="$DEEP_SHELL_BEGIN" -v e="$DEEP_SHELL_END" '
         $0==b { held=0; skip=1; next }  $0==e { skip=0; next }  skip { next }
         held { print ""; held=0 }  $0=="" { held=1; next }  { print }
-        END { if (held) print "" }' "$prof" > "$tmp" || { rm -f "$tmp"; return 1; }
+        END { if (held) print "" }' "$prof" > "$tmp" || { rm -f "$tmp"; deep_tmp_release; return 1; }
     chmod --reference="$prof" "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$prof"
+    if ! mv -f "$tmp" "$prof"; then
+        rm -f "$tmp"; deep_tmp_release; return 1
+    fi
+    deep_tmp_release
 }
 
 deep_shell_profile_add() {
@@ -1265,6 +1404,13 @@ deep_shell_profile_add() {
     if [[ "$launcher" == *[\"\$\`\\]* || "$launcher" == *$'\n'* ]]; then
         ui_log_fail "Launcher path '$launcher' contains shell metacharacters; add the block by hand."
         return 1
+    fi
+    # INFO-8: bash skips ~/.profile once ~/.bash_profile exists, so a new file sources it
+    # first (outside the managed block, so removing the block keeps the login setup).
+    if [[ ! -e "$prof" && "$(basename -- "$prof")" == .bash_profile ]]; then
+        # shellcheck disable=SC2016  # $HOME is expanded by the login shell
+        printf '%s\n' '# Created by oma-server: keep reading ~/.profile like bash does without this file.' \
+            '[ -f "$HOME/.profile" ] && . "$HOME/.profile"' > "$prof" || return 1
     fi
     # shellcheck disable=SC2016  # literal $(tty) belongs in the profile, not expanded here
     {
