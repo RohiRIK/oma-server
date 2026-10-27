@@ -302,7 +302,47 @@ deep_list_gui_clients() {
 # (uwsm puts them in app.slice/app-graphical.slice/...), plus everything exec'd inside
 # the compositor's own service cgroup. Hyprland, the bar/shell, session plumbing, the
 # GUI clients already listed, and this command's own process chain are left out.
-DEEP_SESSION_BOUND_IGNORE_RE='^(Hyprland|hyprland|quickshell|qs|omarchy-shell|waybar|uwsm|uwsm-app|start-hyprland|Xwayland|hyprpaper|hypridle|hyprsunset|swaybg|mako|walker|elephant|fcitx5|systemd|dbus-daemon|dbus-broker|dbus-broker-launch)$'
+DEEP_SESSION_BOUND_IGNORE_RE='^(Hyprland|hyprland|quickshell|qs|omarchy-shell|omarchy-.*|waybar|uwsm|uwsm-app|start-hyprland|Xwayland|hyprpaper|hypridle|hyprsunset|swaybg|swayosd-server|mako|walker|elephant|fcitx5|systemd|dbus-daemon|dbus-broker|dbus-broker-launch|udiskie|socat|inotifywait|udevadm|wl-paste|wl-copy|capture.sh|hyprctl|jq|xkbcli-list|xkbcli)$'
+# Processes started by the bar/shell; anything below them is shell plumbing.
+DEEP_SESSION_BOUND_SHELL_RE='^(quickshell|qs|omarchy-shell|omarchy-launch-shell|omarchy-launch-s)$'
+
+# True when the process (or its script, for `bash /path/x.sh`) lives in an Omarchy
+# or oma-server plugin directory.
+_deep_proc_is_omarchy_helper() {
+    local pid="$1" arg i=0 dir
+    local -a dirs=(/usr/share/omarchy/ /usr/local/bin/omarchy- /usr/bin/omarchy-
+                   "${HOME:-/nonexistent}/.local/share/omarchy/" "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/omarchy/")
+    [[ -n "${OMARCHY_PATH:-}" ]] && dirs+=("${OMARCHY_PATH%/}/")
+    while IFS= read -r -d '' arg && (( i < 2 )); do
+        for dir in "${dirs[@]}"; do
+            [[ "$arg" == "$dir"* ]] && return 0
+        done
+        i=$((i + 1))
+    done < "/proc/$pid/cmdline" 2>/dev/null
+    return 1
+}
+
+# True when an ancestor (walking PPid up to Hyprland or pid 1) is the bar/shell or an
+# Omarchy helper script.
+_deep_proc_under_shell() {
+    local p="$1" n=0 comm
+    while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 && n < 64 )); do
+        p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null || true)
+        [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )) || return 1
+        comm=$(tr -d '\000\n' < "/proc/$p/comm" 2>/dev/null || true)
+        [[ "$comm" == "Hyprland" || "$comm" == "hyprland" || "$comm" == "systemd" ]] && return 1
+        [[ "$comm" =~ $DEEP_SESSION_BOUND_SHELL_RE ]] && return 0
+        _deep_proc_is_omarchy_helper "$p" && return 0
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# Processes that die with the session: every app-*.scope anywhere under app.slice
+# (uwsm puts them in app.slice/app-graphical.slice/...), plus everything exec'd inside
+# the compositor's own service cgroup. Hyprland, the bar/shell and everything it
+# spawned, Omarchy's own helpers, the GUI clients already listed, and this command's
+# own process chain are left out. Prints every match (pid<TAB>comm), uncapped.
 deep_list_session_bound_procs() {
     local gui_pids="${1:-}"
     local uid="${UID:-$(id -u)}"
@@ -327,9 +367,11 @@ deep_list_session_bound_procs() {
             [[ "$self_chain" == *" $pid "* ]] && continue
             comm=$(tr -d '\000\n' < "/proc/$pid/comm" 2>/dev/null || true)
             [[ -z "$comm" || "$comm" =~ $DEEP_SESSION_BOUND_IGNORE_RE ]] && continue
+            _deep_proc_is_omarchy_helper "$pid" && continue
+            _deep_proc_under_shell "$pid" && continue
             printf "%s\t%s\n" "$pid" "$comm"
         done < "$procs"
-    done | awk -F'\t' '!seen[$1]++' | head -n 20
+    done | awk -F'\t' '!seen[$1]++'
 }
 
 deep_on_battery() {
@@ -408,7 +450,7 @@ deep_enter_transaction() {
         ui_log_fail "Could not list Hyprland windows (hyprctl clients -j failed)." "Refusing: cannot verify no unsaved work."
         return 1
     fi
-    local gui_pids=""
+    local gui_pids="" confirmed="false"
     if [[ -n "$clients" ]]; then
         local n; n=$(printf "%s\n" "$clients" | grep -c .)
         ui_log_warn "${n} open window(s) would be closed (unsaved work is lost, windows are NOT restored):"
@@ -425,28 +467,33 @@ deep_enter_transaction() {
             return 3
         fi
         local answer=""
+        (( timeout_sec == 0 )) && ui_log_warn "No --timeout: nothing will bring the desktop back on its own." \
+            "Ways back: SSH 'oma-server disable'; Ctrl+Alt+F2 at the machine; reboot; or '${DEEP_PANIC_HINT}'."
         printf "%s Type 'yes' to close these windows and enter DEEP_SERVER: " "$(ui_badge_warn)"
         read -r answer || answer=""
         if [[ "$answer" != "yes" ]]; then
             ui_log_info "Not confirmed (expected the word 'yes'). Nothing was changed."
             return 3
         fi
+        confirmed="true"
     fi
 
     local bound
     bound=$(deep_list_session_bound_procs "$gui_pids" || true)
     if [[ -n "$bound" ]]; then
         ui_log_warn "These session-bound processes will also stop (move agents to 'systemd-run --user' units or tmux started that way):"
-        printf "%s\n" "$bound" | awk -F'\t' '{printf "         - %s (pid %s)\n", $2, $1}' >&2
+        printf "%s\n" "$bound" | awk -F'\t' 'NR <= 20 {printf "         - %s (pid %s)\n", $2, $1}
+            END { if (NR > 20) printf "         ...and %d more\n", NR - 20 }' >&2
     fi
 
     if (( timeout_sec == 0 )); then
-        ui_log_warn "No --timeout: nothing will bring the desktop back on its own." \
+        # With --close-apps the typed 'yes' above was the one confirmation.
+        [[ "$confirmed" == "true" ]] || ui_log_warn "No --timeout: nothing will bring the desktop back on its own." \
             "Ways back: SSH 'oma-server disable'; Ctrl+Alt+F2 at the machine; reboot; or '${DEEP_PANIC_HINT}'."
         if deep_on_battery; then
             ui_log_warn "On battery: the sleep/lid inhibitor keeps the machine awake indefinitely (heat, drain)."
         fi
-        if [[ -t 0 ]]; then
+        if [[ -t 0 && "$confirmed" != "true" ]]; then
             printf "%s Press Enter to continue, Ctrl+C to abort: " "$(ui_badge_info)"
             read -r _ || true
         fi
@@ -493,12 +540,24 @@ deep_enter_transaction() {
         return 1
     fi
 
-    deep_follow_enter
+    deep_follow_enter "$config_file"
+}
+
+# N2: the follower must outlast the longest legitimate enter: the queued-job wait,
+# the exit wait (a failed enter runs the exit sequence) and ~60s of steps.
+deep_follow_seconds() {
+    local config_file="$1" job_wait exit_wait
+    job_wait=$(config_get_scalar "$config_file" "deep" "job_wait_seconds" "180")
+    [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )) || job_wait=180
+    exit_wait=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
+    [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )) || exit_wait=45
+    echo $(( job_wait + exit_wait + 60 ))
 }
 
 # Tails deep.log until the worker reaches DEEP_SERVER or rolls back.
 deep_follow_enter() {
-    local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-180}"
+    local config_file="${1:-}"
+    local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-$(deep_follow_seconds "$config_file")}"
     local deadline=$(( $(date +%s) + follow_max ))
     local printed=0 total line state
     _deep_follow_print() {

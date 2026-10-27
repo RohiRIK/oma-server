@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
 # uninstall.sh - Safe uninstaller for oma-server on Omarchy Linux systems.
 # Restores HOST_LAPTOP baseline before removing runtime artifacts, hooks, and bar widget.
 set -euo pipefail

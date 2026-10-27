@@ -107,6 +107,21 @@ has_graphical_session() {
 }
 
 CURRENT_UID="${UID:-$(id -u)}"
+
+# Waits (up to $1 seconds) until quickshell has an IPC socket again. Best effort: when
+# the runtime dir has no quickshell folder at all there is nothing to wait for.
+wait_for_shell_ipc() {
+    local max="${1:-10}" qs_dir="${XDG_RUNTIME_DIR:-/run/user/$CURRENT_UID}/quickshell" i
+    [[ -d "$qs_dir" ]] || return 0
+    for (( i = 0; i < max * 2; i++ )); do
+        if find "$qs_dir" -type s -name 'ipc.sock' -print -quit 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep "${OMA_INSTALL_IPC_POLL:-0.5}"
+    done
+    return 1
+}
+
 widget_status="skipped"
 widget_detail=""
 
@@ -135,14 +150,24 @@ if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT
     if command -v omarchy >/dev/null 2>&1; then
         enable_out=""
         enable_rc=1
-        # The shell may still be starting after a restart; retry the IPC briefly.
-        for _attempt in 1 2 3; do
+        # The shell may still be restarting (right after uninstall's 'plugin disable'
+        # or omarchy-restart-shell), which shows up as an IPC timeout or
+        # 'QLocalSocket::PeerClosedError'. Wait for the quickshell IPC socket, then
+        # retry with a growing backoff (1+2+3+4+5 s by default, ~15 s in total).
+        enable_tries="${OMA_INSTALL_ENABLE_TRIES:-6}"
+        enable_step="${OMA_INSTALL_ENABLE_BACKOFF:-1}"
+        wait_for_shell_ipc 10
+        for (( _attempt = 1; _attempt <= enable_tries; _attempt++ )); do
             enable_rc=0
             enable_out=$(OMARCHY_SHELL_IPC_TIMEOUT=5s omarchy plugin enable rohirik.oma-server --section right 2>&1) || enable_rc=$?
             # omarchy-plugin-enable is idempotent: an already-enabled widget still
             # returns exit 0 ("Enabled and moved <id>"), so exit status is the signal.
             (( enable_rc == 0 )) && break
-            sleep 1
+            (( _attempt < enable_tries )) || break
+            if [[ "$enable_out" == *PeerClosedError* || "$enable_out" == *"timed out"* || "$enable_out" == *"Socket Error"* ]]; then
+                wait_for_shell_ipc 10
+            fi
+            sleep "$(awk -v a="$_attempt" -v s="$enable_step" 'BEGIN { printf "%.2f", a * s }')"
         done
         if (( enable_rc == 0 )); then
             widget_status="enabled"

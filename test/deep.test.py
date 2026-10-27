@@ -1334,11 +1334,13 @@ echo "oma-server $*" >> "{self.log}"
         self.assertIn("real sudo reachable", res2.stderr)
 
     def test_n1_exported_sudo_function_refused(self):
-        env = {"BASH_FUNC_sudo%%": '() {  /usr/bin/sudo "$@"; }'}
+        marker = self.base / "hijacked"
+        env = {"BASH_FUNC_sudo%%": f'() {{  touch {marker}; /usr/bin/sudo "$@"; }}'}
+        # Via the shebang (bash -p) the function is never imported at all.
         res = self.cli("status", extra_env=env)
-        self.assertEqual(res.returncode, 2, res.plain)
-        self.assertIn("sudo is a function", res.plain)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertFalse(marker.exists())
+        # Run with plain 'bash' (no -p), the in-script guard still refuses it.
         res2 = self.run_script("uninstall.sh", extra=env)
         self.assertEqual(res2.returncode, 2, res2.stdout + res2.stderr)
         self.assertIn("sudo is a function", res2.stderr)
@@ -1361,6 +1363,163 @@ echo "oma-server $*" >> "{self.log}"
         res = self.cli("status", extra_env={"PATH": f"{shim}:{self.bin}:/usr/bin:/bin"})
         self.assertEqual(res.returncode, 2, res.plain)
         self.assertIn("real pkexec reachable", res.plain)
+
+
+class FollowUpFixTests3(DeepSandbox):
+    """PR #3 third VM pass: Quill N1-N4 + close-apps UX, Sam INFO-1 (bash -p)."""
+
+    def cgroup(self):
+        cg = self.base / "cgroup"
+        uid = os.getuid()
+        mgr = cg / f"user.slice/user-{uid}.slice/user@{uid}.service"
+        wm = mgr / "session.slice/wayland-wm@hyprland.desktop.service"
+        wm.mkdir(parents=True)
+        return cg, wm
+
+    def spawn(self, *argv, **kw):
+        pr = subprocess.Popen(list(argv), **kw)
+        self.addCleanup(lambda: (pr.kill(), pr.wait()))
+        return pr
+
+    def children(self, pid):
+        import time
+        for _ in range(50):
+            out = subprocess.run(["/usr/bin/pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+            if out:
+                return [int(x) for x in out]
+            time.sleep(0.05)
+        self.fail(f"no children of {pid}")
+
+    # ---- N1: no flood from the bar and Omarchy helpers ----
+    def test_n1_skips_shell_descendants_and_omarchy_helpers(self):
+        self.install_helper()
+        cg, wm = self.cgroup()
+        bash = shutil.which("bash")
+        fake_qs = self.base / "quickshell"
+        shutil.copy(bash, fake_qs)
+        qs = self.spawn(str(fake_qs), "-c", "sleep 30 & bash -lc 'sleep 30' & wait")
+        qs_kids = self.children(qs.pid)
+        omarchy = self.base / "omarchy"
+        (omarchy / "bin").mkdir(parents=True)
+        helper = omarchy / "bin/display-sync"
+        helper.write_text("sleep 30\nsleep 1\n")
+        hs = self.spawn(bash, str(helper))
+        hs_kids = self.children(hs.pid)
+        fake_socat = self.base / "socat"
+        shutil.copy(shutil.which("sleep"), fake_socat)
+        so = self.spawn(str(fake_socat), "30")
+        agent = self.spawn("tail", "-f", "/dev/null")
+        pids = [qs.pid, *qs_kids, hs.pid, *hs_kids, so.pid, agent.pid]
+        (wm / "cgroup.procs").write_text("".join(f"{p}\n" for p in pids))
+        res = self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg), "OMARCHY_PATH": str(omarchy)})
+        self.assertEqual(res.returncode, 0, res.plain)
+        listed = re.findall(r"- (\S+) \(pid (\d+)\)", res.plain)
+        self.assertEqual(listed, [("tail", str(agent.pid))], res.plain)
+
+    def test_n1_prints_and_n_more_instead_of_silent_cut(self):
+        self.install_helper()
+        cg, wm = self.cgroup()
+        agents = [self.spawn("tail", "-f", "/dev/null") for _ in range(23)]
+        (wm / "cgroup.procs").write_text("".join(f"{a.pid}\n" for a in agents))
+        res = self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(len(re.findall(r"- tail \(pid \d+\)", res.plain)), 20)
+        self.assertIn("...and 3 more", res.plain)
+
+    # ---- N2: follower outlasts job wait + exit wait ----
+    def follow_seconds(self, extra=""):
+        src = self.cfg.read_text()
+        if extra:
+            for k, v in extra.items():
+                src = re.sub(rf"^{k} = \d+", f"{k} = {v}", src, flags=re.M)
+            self.cfg.write_text(src)
+        out = subprocess.run(["bash", "-c", f'source lib/ui.sh; source lib/config.sh; source lib/deep.sh; deep_follow_seconds "{self.cfg}"'],
+                             cwd=ROOT, capture_output=True, text=True, timeout=10,
+                             env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return int(out.stdout.strip())
+
+    def test_n2_follow_deadline_covers_job_and_exit_wait(self):
+        self.assertEqual(self.follow_seconds(), 180 + 1 + 60)   # sandbox config: exit_wait_seconds = 1
+        self.assertEqual(self.follow_seconds({"job_wait_seconds": 600, "exit_wait_seconds": 45}), 705)
+        self.assertEqual(self.follow_seconds({"job_wait_seconds": 9999}), 180 + 45 + 60)
+        src = (ROOT / "lib/deep.sh").read_text()
+        self.assertIn('deep_follow_enter "$config_file"', src)
+        self.assertIn('${OMA_DEEP_FOLLOW_SECONDS:-$(deep_follow_seconds "$config_file")}', src)
+
+    # ---- N4: status flags allowed-but-missing helper ----
+    def test_n4_status_degraded_when_allowed_but_helper_missing(self):
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertTrue(st["deep_allowed"])
+        self.assertFalse(st["deep_helper_ok"])
+        self.assertEqual(st["health"], "DEGRADED")
+        self.assertIn("deep helper missing", st["health_hint"])
+        self.assertIn("deep helper missing", self.cli("status").plain)
+
+    def test_n4_status_ok_when_helper_present_or_not_allowed(self):
+        self.install_helper()
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertTrue(st["deep_helper_ok"])
+        self.assertEqual(st["health"], "OK")
+        self.helper_path.unlink()
+        self.write_config(allowed=False)
+        st2 = json.loads(self.cli("status", "--json").stdout)
+        self.assertEqual(st2["health"], "OK")
+        self.assertNotIn("deep helper missing", self.cli("status").plain)
+
+    # ---- --close-apps: one confirmation ----
+    def test_close_apps_single_confirmation(self):
+        self.install_helper()
+        self.set_clients([{"class": "foot", "title": "t", "pid": 9}])
+        res = self.cli_tty("enable", "--deep", "--close-apps", answers="yes\n")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertNotIn("Press Enter", res.plain)
+        self.assertLess(res.plain.index("No --timeout"), res.plain.index("Type 'yes'"))
+        self.assertEqual(res.plain.count("No --timeout"), 1)
+        self.assertEqual(self.deep_state()["state"], "DEEP_SERVER")
+
+    def test_no_windows_without_timeout_still_asks_enter_once(self):
+        self.install_helper()
+        res = self.cli_tty("enable", "--deep", answers="\n")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(res.plain.count("Press Enter"), 1)
+
+    # ---- Sam INFO-1: bash -p entrypoints ----
+    def test_info1_entrypoints_use_bash_p(self):
+        for f in ("bin/oma-server", "bin/omarchy-server-mode", "uninstall.sh", "hooks/post-boot.d/99-server-profile-check.sh"):
+            first = (ROOT / f).read_text().splitlines()[0]
+            self.assertEqual(first, "#!/usr/bin/env -S bash -p", f)
+        self.assertEqual((ROOT / "bin/oma-server").read_bytes(), (ROOT / "bin/omarchy-server-mode").read_bytes())
+
+    def test_info1_shadowed_type_and_realpath_do_not_bypass_guard(self):
+        real = shutil.which("sudo", path="/usr/bin:/bin:/usr/local/bin")
+        if not real:
+            self.skipTest("no real sudo on this host")
+        env = self.env({
+            "PATH": f"/usr/bin:/bin:{self.bin}",
+            "BASH_FUNC_type%%": "() {  echo file; }",
+            "BASH_FUNC_realpath%%": f"() {{  echo {self.base}/fake-sudo; }}",
+            "BASH_FUNC_stat%%": "() {  echo 1000; }",
+            "BASH_FUNC_unset%%": "() {  :; }",
+        })
+        for argv in ([str(OMA_BIN), "status"], [str(ROOT / "bin/omarchy-server-mode"), "status"], [str(ROOT / "uninstall.sh")]):
+            res = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(res.returncode, 2, f"{argv}: {res.stdout}{res.stderr}")
+            self.assertIn("real sudo reachable", res.stderr)
+
+    def test_info1_hook_ignores_exported_functions(self):
+        marker = self.base / "hijacked"
+        self.write_deep_state(state="DEEP_SERVER")
+        write_executable(self.bin / "oma-server", f"""#!/usr/bin/env bash
+echo "oma-server $*" >> "{self.log}"
+""")
+        env = self.env({"BASH_FUNC_systemd-run%%": f"() {{  touch {marker}; }}",
+                        "BASH_FUNC_jq%%": f"() {{  touch {marker}; }}"})
+        res = subprocess.run([str(ROOT / "hooks/post-boot.d/99-server-profile-check.sh")], capture_output=True,
+                             text=True, env=env, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("oma-server __deep-post-boot", self.calls())
 
 
 if __name__ == "__main__":

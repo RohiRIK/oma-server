@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
 # ~/.config/omarchy/hooks/post-boot.d/99-server-profile-check.sh
 # Post-boot and session recovery hook for oma-server (Omarchy Server-Mode).
 # Guarantees that any unexpected reboot, crash, or session restart cleanly

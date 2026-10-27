@@ -1,4 +1,6 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: privileged mode never imports exported functions (BASH_FUNC_*%%), BASH_ENV,
+# ENV or SHELLOPTS from the caller, so nothing can shadow sudo/type/realpath here.
 # ~/.config/omarchy/plugins/server-mode/bin/omarchy-server-mode
 # Enterprise CLI coordinator for oma-server (Omarchy Server-Mode)
 set -euo pipefail
@@ -340,6 +342,14 @@ case "$cmd" in
         if [[ -f "$DEEP_LAST_FILE" ]] && jq -e 'type == "object"' "$DEEP_LAST_FILE" >/dev/null 2>&1; then
             last_deep="$(jq -c . "$DEEP_LAST_FILE")"
         fi
+        # N4: deep is allowed in config but the root helper is gone (e.g. an orphaned
+        # grant): enable --deep would refuse, so say so instead of reporting OK.
+        deep_helper_ok="true"
+        deep_helper_hint=""
+        if [[ "$deep_allowed" == "true" ]] && ! deep_helper_installed; then
+            deep_helper_ok="false"
+            deep_helper_hint="deep helper missing; run '$CMD_NAME deep-setup' or '$CMD_NAME deep-setup --remove'"
+        fi
         if [[ "$as_json" == "true" ]]; then
             if deep_state_exists; then
                 status_json="$(deep_status true)"
@@ -347,13 +357,20 @@ case "$cmd" in
                 status_json="$(collect_status_telemetry true)"
             fi
             printf "%s" "$status_json" | jq --argjson allowed "$deep_allowed" --argjson last "$last_deep" \
-                '. + {is_deep: (.is_deep // false), deep_allowed: $allowed, last_deep: $last}'
+                --argjson hok "$deep_helper_ok" --arg hhint "$deep_helper_hint" \
+                '. + {is_deep: (.is_deep // false), deep_allowed: $allowed, last_deep: $last, deep_helper_ok: $hok}
+                 | if $hok then . else .health = "DEGRADED"
+                     | .health_hint = ([(.health_hint // ""), $hhint] | map(select(length > 0)) | join("; ")) end'
             exit 0
         fi
         if deep_state_exists; then
             deep_status false
         else
             collect_status_telemetry false
+        fi
+        if [[ "$deep_helper_ok" != "true" ]]; then
+            ui_log_warn "Health      : DEGRADED, ${deep_helper_hint}." \
+                "[deep] allowed = true, but $DEEP_HELPER_PATH is missing or unsafe, so 'enable --deep' refuses."
         fi
         exit 0
         ;;

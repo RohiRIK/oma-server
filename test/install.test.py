@@ -70,6 +70,15 @@ if [[ "$1 $2" == "plugin enable" && "${{OMA_TEST_ENABLE_FAIL:-0}}" == "1" ]]; th
     echo "error: omarchy-shell IPC timed out" >&2
     exit 1
 fi
+if [[ "$1 $2" == "plugin enable" && -n "${{OMA_TEST_ENABLE_FAIL_TIMES:-}}" ]]; then
+    cnt="{self.base}/enable-fails"
+    n=$(cat "$cnt" 2>/dev/null || echo 0)
+    if (( n < OMA_TEST_ENABLE_FAIL_TIMES )); then
+        echo $((n + 1)) > "$cnt"
+        echo "WARN quickshell.ipc: Socket Error QLocalSocket::PeerClosedError" >&2
+        exit 1
+    fi
+fi
 exit 0
 """)
 
@@ -82,6 +91,9 @@ exit 0
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.config),
             "TERM": "dumb",
+            "XDG_RUNTIME_DIR": str(self.base / "xdg-runtime"),
+            "OMA_INSTALL_ENABLE_BACKOFF": "0.01",
+            "OMA_INSTALL_IPC_POLL": "0.01",
         }
         if graphical:
             env["WAYLAND_DISPLAY"] = "wayland-1"
@@ -129,6 +141,38 @@ exit 0
         res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1"}, graphical=True)
         self.assertEqual(res.returncode, 0, res.plain)
         self.assertIn("restart-shell", self.calls())
+
+    def enable_calls(self):
+        return [c for c in self.calls().splitlines() if c.startswith("omarchy plugin enable")]
+
+    def test_n3_widget_enable_retries_after_peer_closed(self):
+        res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1", "OMA_TEST_ENABLE_FAIL_TIMES": "3"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(len(self.enable_calls()), 4)
+        self.assertNotIn("FAILED", res.plain)
+
+    def test_n3_waits_for_quickshell_ipc_socket(self):
+        import socket, threading
+        qs = self.base / "xdg-runtime/quickshell/by-id/abc"
+        qs.mkdir(parents=True)
+        sock = socket.socket(socket.AF_UNIX)
+        def bind():
+            sock.bind(str(qs / "ipc.sock"))
+        t = threading.Timer(0.1, bind)
+        t.start()
+        try:
+            res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1", "OMA_TEST_ENABLE_FAIL_TIMES": "1",
+                                                           "OMA_INSTALL_IPC_POLL": "0.05"})
+        finally:
+            t.cancel(); sock.close()
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(len(self.enable_calls()), 2)
+
+    def test_n3_gives_up_after_bounded_retries(self):
+        res = self.run_script("install.sh", extra_env={"OMA_TEST_SHELL_RUNNING": "1", "OMA_TEST_ENABLE_FAIL_TIMES": "99"})
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertEqual(len(self.enable_calls()), 6)
+        self.assertIn("PeerClosedError", res.plain)
 
     def test_install_reports_widget_enable_failure_honestly(self):
         res = self.run_script(
