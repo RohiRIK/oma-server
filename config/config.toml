@@ -34,4 +34,5 @@ services = [
 allowed = false
 stop_display_manager = true
 exit_wait_seconds = 45             # how long `disable` waits for Hyprland to come back
+job_wait_seconds = 180             # if uwsm refuses to stop because a user start job is queued, wait this long (0-600) for the queue to drain, then retry once
 require_ssh = true                 # refuse unless sshd.service is active

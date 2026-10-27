@@ -171,6 +171,14 @@ if [[ "$1" == "-l" && "$2" == "-l" ]]; then
   [[ -e "$S/grant" && -f "$HELPER" ]] && {{ echo "Options: !authenticate"; exit 0; }}
   exit 1
 fi
+if [[ "$1" == "-l" ]]; then
+  echo "sudo ${{nflag}}-l" >> "{L}"
+  [[ -e "$S/list-needs-pw" ]] && {{ echo "sudo: a password is required" >&2; exit 1; }}
+  echo "User tester may run the following commands:"
+  echo "    (ALL) /usr/bin/true"
+  [[ -e "{self.sudoers_path}" ]] && echo "    (root) NOPASSWD: $HELPER check, $HELPER dm-stop"
+  exit 0
+fi
 echo "sudo ${{nflag}}$*" >> "{L}"
 if [[ "$1" == "$HELPER" ]]; then
   verb="$2"
@@ -1051,7 +1059,7 @@ echo "oma-server $*" >> "{self.log}"
             self.skipTest("no real sudo on this host")
         res = self.cli("status", extra_env={"PATH": f"/usr/bin:/bin:{self.bin}"})
         self.assertEqual(res.returncode, 2, res.plain)
-        self.assertIn("real sudo on PATH", res.plain)
+        self.assertIn("real sudo reachable", res.plain)
 
     def test_s1_uninstall_guarded_too(self):
         env = self.env({"OMA_SERVER_TEST_MODE": ""})
@@ -1139,6 +1147,220 @@ echo "oma-server $*" >> "{self.log}"
         self.assertNotEqual(self.cli("enable", "--deep").returncode, 0)
         (self.root / "usr/local/lib").chmod(0o755)
         self.assertEqual(self.cli("enable", "--deep").returncode, 0)
+
+
+class FollowUpFixTests2(DeepSandbox):
+    """PR #3 second VM pass: Quill B1-B5, Sam N1."""
+
+    def helper_calls(self):
+        return [c.split("deep-helper ", 1)[1] for c in self.calls()
+                if "deep-helper " in c and c.startswith("sudo") and "-l -l" not in c]
+
+    def deep_log(self):
+        p = self.deep_dir / "deep.log"
+        return p.read_text() if p.exists() else ""
+
+    def run_script(self, name, extra=None, tty=False):
+        env = self.env(extra)
+        if tty:
+            return subprocess.run(["script", "-qec", f"bash {ROOT / name}; echo __RC=$?", "/dev/null"], input="\n",
+                                  capture_output=True, text=True, env=env, timeout=60)
+        return subprocess.run(["bash", str(ROOT / name)], stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    # ---- B1: session-bound processes in nested uwsm cgroups ----
+    def test_b1_lists_nested_scopes_and_wm_service_but_not_hyprland(self):
+        self.install_helper()
+        cg = self.base / "cgroup"
+        uid = os.getuid()
+        mgr = cg / f"user.slice/user-{uid}.slice/user@{uid}.service"
+        scope = mgr / "app.slice/app-graphical.slice/app-Hyprland-agent-1.scope"
+        wm = mgr / "session.slice/wayland-wm@hyprland.desktop.service"
+        scope.mkdir(parents=True)
+        wm.mkdir(parents=True)
+        fake_hypr = self.base / "Hyprland"
+        shutil.copy(shutil.which("sleep"), fake_hypr)
+        agent = subprocess.Popen(["sleep", "30"])
+        child = subprocess.Popen(["tail", "-f", "/dev/null"])
+        hypr = subprocess.Popen([str(fake_hypr), "30"])
+        try:
+            (scope / "cgroup.procs").write_text(f"{agent.pid}\n")
+            (wm / "cgroup.procs").write_text(f"{hypr.pid}\n{child.pid}\n")
+            res = self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+        finally:
+            for pr in (agent, child, hypr):
+                pr.kill(); pr.wait()
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("session-bound processes will also stop", res.plain)
+        self.assertIn(f"sleep (pid {agent.pid})", res.plain)
+        self.assertIn(f"tail (pid {child.pid})", res.plain)
+        self.assertNotIn(f"pid {hypr.pid}", res.plain)
+
+    def test_b1_no_warning_without_session_bound_work(self):
+        self.install_helper()
+        cg = self.base / "cgroup"
+        uid = os.getuid()
+        (cg / f"user.slice/user-{uid}.slice/user@{uid}.service/app.slice").mkdir(parents=True)
+        res = self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertNotIn("session-bound", res.plain)
+
+    # ---- B2: orphaned sudoers rule ----
+    def orphan(self):
+        self.install_helper(grant=False)
+        self.helper_path.unlink()
+        self.helper_path.parent.rmdir()
+
+    def test_b2_uninstall_detects_orphaned_rule(self):
+        self.run_script("install.sh")
+        self.orphan()
+        res = self.run_script("uninstall.sh")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("deep-setup --remove", res.stderr)
+        self.assertIn("sudo -n -l", self.calls())
+        self.assertTrue((self.cfg_dir / "bin/oma-server").exists())
+
+    def test_b2_uninstall_with_tty_removes_orphaned_rule(self):
+        if not shutil.which("script"):
+            self.skipTest("no script")
+        self.run_script("install.sh")
+        self.orphan()
+        self.run_script("uninstall.sh", tty=True)
+        self.assertFalse(self.sudoers_path.exists())
+        self.assertFalse((self.cfg_dir / "bin").exists())
+
+    def test_b2_remove_without_tty_refuses_on_orphaned_rule(self):
+        self.orphan()
+        res = self.cli("deep-setup", "--remove")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("interactive terminal", res.plain)
+        self.assertTrue(self.sudoers_path.exists())
+
+    def test_b2_uninstall_warns_when_rule_cannot_be_checked(self):
+        self.run_script("install.sh")
+        (self.s / "list-needs-pw").touch()
+        res = self.run_script("uninstall.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn(f"sudo rm -f {self.sudoers_path}", res.stderr)
+
+    def test_b2_uninstall_quiet_when_no_rule(self):
+        self.run_script("install.sh")
+        res = self.run_script("uninstall.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("sudo rm -f", res.stderr)
+
+    # ---- B3: wait for the user job queue to drain ----
+    def test_b3_waits_for_queue_to_drain_then_retries(self):
+        import threading
+        self.install_helper()
+        self.write_config(allowed=True, extra="")
+        jobs = self.s / "user-jobs"
+        jobs.write_text("42 try-omarchy-desktop-ready.service start running\n")
+        t = threading.Timer(1.5, lambda: jobs.unlink())
+        t.start()
+        try:
+            res = self.cli("enable", "--deep", extra_env={"OMA_TEST_UWSM_FAIL_ONCE": "1"})
+        finally:
+            t.cancel()
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.calls().count("uwsm stop"), 2)
+        self.assertIn("waiting up to 180s for queued user jobs", self.deep_log())
+        self.assertEqual(self.deep_state()["state"], "DEEP_SERVER")
+
+    def test_b3_rolls_back_naming_the_queued_unit(self):
+        self.install_helper()
+        src = self.cfg.read_text().replace("job_wait_seconds = 180", "job_wait_seconds = 1")
+        self.cfg.write_text(src)
+        (self.s / "user-jobs").write_text("42 try-omarchy-desktop-ready.service start running\n")
+        res = self.cli("enable", "--deep", extra_env={"OMA_TEST_UWSM_FAIL": "1"})
+        self.assertEqual(res.returncode, 1, res.plain)
+        self.assertIn("a start job is still queued: try-omarchy-desktop-ready.service", self.last_deep()["reason"])
+        self.assertIsNone(self.deep_state())
+
+    def test_b3_default_is_documented(self):
+        self.assertIn("job_wait_seconds = 180", (ROOT / "config/config.toml").read_text())
+        self.assertIn("job_wait_seconds", (ROOT / "README.md").read_text())
+
+    # ---- B4: follow prints deep.log to the end ----
+    def test_b4_final_log_line_is_printed(self):
+        self.install_helper()
+        res = self.cli("enable", "--deep")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("DEEP_SERVER active (MemAvailable now", res.plain)
+        out = res.plain
+        self.assertLess(out.index("DEEP_SERVER active (MemAvailable now"), out.index("DEEP_SERVER active. Desktop"))
+
+    def test_b4_worker_logs_before_flipping_state(self):
+        src = (ROOT / "lib/deep.sh").read_text()
+        i_log = src.index('deep_log "DEEP_SERVER active (MemAvailable now')
+        i_set = src.index("deep_state_set state '\"DEEP_SERVER\"'", i_log - 400)
+        self.assertLess(i_log, i_set)
+
+    # ---- B5: unique post-boot unit ----
+    def test_b5_postboot_unit_unique_and_reset_failed_first(self):
+        self.write_deep_state(state="DEEP_SERVER")
+        write_executable(self.bin / "oma-server", f"""#!/usr/bin/env bash
+echo "oma-server $*" >> "{self.log}"
+""")
+        hook = ["bash", str(ROOT / "hooks/post-boot.d/99-server-profile-check.sh")]
+        subprocess.run(hook, capture_output=True, env=self.env(), timeout=20)
+        subprocess.run(hook, capture_output=True, env=self.env(), timeout=20)
+        calls = self.calls()
+        units = [re.search(r"--unit=(\S+)", c).group(1) for c in calls if c.startswith("systemd-run --user")]
+        self.assertEqual(len(units), 2, calls)
+        self.assertNotEqual(units[0], units[1])
+        boot8 = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().replace("-", "")[:8]
+        for u in units:
+            self.assertTrue(u.startswith(f"oma-server-deep-postboot-{boot8}-"), u)
+        i_reset = calls.index("systemctl --user reset-failed oma-server-deep-postboot*")
+        i_run = next(i for i, c in enumerate(calls) if c.startswith("systemd-run --user"))
+        self.assertLess(i_reset, i_run)
+        self.assertIn("--collect", calls[i_run])
+
+    # ---- N1: real sudo must not be reachable in test mode ----
+    def test_n1_symlink_to_real_sudo_refused(self):
+        real = shutil.which("sudo", path="/usr/bin:/bin:/usr/local/bin")
+        if not real:
+            self.skipTest("no real sudo on this host")
+        shim = self.base / "shim"
+        shim.mkdir()
+        (shim / "sudo").symlink_to(real)
+        env = {"PATH": f"{shim}:{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin"}
+        res = self.cli("status", extra_env=env)
+        self.assertEqual(res.returncode, 2, res.plain)
+        self.assertIn("real sudo reachable", res.plain)
+        res2 = self.run_script("uninstall.sh", extra=env)
+        self.assertEqual(res2.returncode, 2, res2.stdout + res2.stderr)
+        self.assertIn("real sudo reachable", res2.stderr)
+
+    def test_n1_exported_sudo_function_refused(self):
+        env = {"BASH_FUNC_sudo%%": '() {  /usr/bin/sudo "$@"; }'}
+        res = self.cli("status", extra_env=env)
+        self.assertEqual(res.returncode, 2, res.plain)
+        self.assertIn("sudo is a function", res.plain)
+        self.assertEqual(self.calls(), [])
+        res2 = self.run_script("uninstall.sh", extra=env)
+        self.assertEqual(res2.returncode, 2, res2.stdout + res2.stderr)
+        self.assertIn("sudo is a function", res2.stderr)
+
+    def test_n1_exported_function_dropped_outside_test_mode(self):
+        out = subprocess.run(
+            ["bash", "-c", 'source lib/ui.sh; source lib/config.sh; source lib/deep.sh; type -t sudo || echo none'],
+            cwd=ROOT, capture_output=True, text=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "BASH_FUNC_sudo%%": "() {  echo hijacked; }"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("function", out.stdout)
+
+    def test_n1_root_owned_or_setuid_stub_refused(self):
+        real_true = os.path.realpath(shutil.which("true"))
+        if os.stat(real_true).st_uid != 0:
+            self.skipTest("/usr/bin/true is not root-owned here")
+        shim = self.base / "shim"
+        shim.mkdir()
+        (shim / "pkexec").symlink_to(real_true)
+        res = self.cli("status", extra_env={"PATH": f"{shim}:{self.bin}:/usr/bin:/bin"})
+        self.assertEqual(res.returncode, 2, res.plain)
+        self.assertIn("real pkexec reachable", res.plain)
 
 
 if __name__ == "__main__":

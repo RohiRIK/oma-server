@@ -25,16 +25,24 @@ deep_guard_test_root() {
        && "$(realpath -e -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$DEEP_ROOT_PREFIX" \
        && "$(stat -c %u -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$(id -u)" ]] || {
         echo "OMA_SERVER_TEST_ROOT must be a real, user-owned absolute dir" >&2; exit 2; }
-    local b
+    # N1: a real sudo/pkexec must not be reachable at all: not as a function, alias or
+    # builtin, not via a symlink, and not as any setuid/setgid or root-owned binary.
+    local b t r
     for b in sudo pkexec; do
-        case "$(command -v "$b" 2>/dev/null)" in
-            /usr/bin/*|/bin/*|/usr/local/bin/*|/usr/sbin/*|/sbin/*)
-                echo "OMA_SERVER_TEST_ROOT refused: real $b on PATH" >&2; exit 2 ;;
-        esac
+        t=$(type -t "$b" 2>/dev/null || true)
+        [[ -z "$t" ]] && continue
+        [[ "$t" == file ]] || { echo "OMA_SERVER_TEST_ROOT refused: $b is a $t" >&2; exit 2; }
+        r=$(realpath -e -- "$(type -P "$b")" 2>/dev/null) || { echo "OMA_SERVER_TEST_ROOT refused: $b unresolvable" >&2; exit 2; }
+        if [[ -u "$r" || -g "$r" || "$(stat -c %u -- "$r" 2>/dev/null)" == 0 ]]; then
+            echo "OMA_SERVER_TEST_ROOT refused: real $b reachable ($r)" >&2; exit 2
+        fi
     done
     return 0
 }
 deep_guard_test_root
+# Never let an inherited shell function (BASH_FUNC_sudo%%) stand in for sudo/pkexec.
+# (In test mode the guard above has already refused one.)
+unset -f sudo pkexec 2>/dev/null || true
 DEEP_HELPER_REAL_PATH="/usr/local/lib/oma-server/deep-helper"
 DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}${DEEP_HELPER_REAL_PATH}"
 DEEP_HELPER_DIR="${DEEP_HELPER_PATH%/*}"
@@ -195,7 +203,19 @@ deep_helper_installed() {
 # True when anything of the deep-mode root footprint is visible to the user.
 deep_footprint_visible() {
     [[ -e "$DEEP_HELPER_PATH" || -d "$DEEP_HELPER_DIR" ]] && return 0
-    deep_grant_ok
+    deep_grant_ok && return 0
+    [[ "$(deep_rule_listed)" == "yes" ]]
+}
+
+# B2: does 'sudo -n -l' still list a rule for the helper path? Works even when the
+# helper itself is gone (orphaned sudoers file). Prints yes / no / unknown.
+deep_rule_listed() {
+    command -v sudo >/dev/null 2>&1 || { echo no; return 0; }
+    local out
+    if ! out=$(sudo -n -l 2>/dev/null); then
+        echo unknown; return 0
+    fi
+    if printf "%s\n" "$out" | grep -qF -- "$DEEP_HELPER_PATH"; then echo yes; else echo no; fi
 }
 
 # Omarchy-style probe (bin/omarchy-dns): lists the grant, runs and prompts nothing.
@@ -278,21 +298,38 @@ deep_list_gui_clients() {
 }
 
 # Non-GUI processes in app-*.scope cgroups (tmux, agents, ...) die with the session.
+# Processes that die with the session: every app-*.scope anywhere under app.slice
+# (uwsm puts them in app.slice/app-graphical.slice/...), plus everything exec'd inside
+# the compositor's own service cgroup. Hyprland, the bar/shell, session plumbing, the
+# GUI clients already listed, and this command's own process chain are left out.
+DEEP_SESSION_BOUND_IGNORE_RE='^(Hyprland|hyprland|quickshell|qs|omarchy-shell|waybar|uwsm|uwsm-app|start-hyprland|Xwayland|hyprpaper|hypridle|hyprsunset|swaybg|mako|walker|elephant|fcitx5|systemd|dbus-daemon|dbus-broker|dbus-broker-launch)$'
 deep_list_session_bound_procs() {
     local gui_pids="${1:-}"
     local uid="${UID:-$(id -u)}"
-    local base="${OMA_SERVER_TEST_CGROUP_ROOT:-/sys/fs/cgroup}/user.slice/user-${uid}.slice/user@${uid}.service/app.slice"
-    [[ -d "$base" ]] || return 0
+    local mgr="${OMA_SERVER_TEST_CGROUP_ROOT:-/sys/fs/cgroup}/user.slice/user-${uid}.slice/user@${uid}.service"
+    [[ -d "$mgr" ]] || return 0
+    local self_chain=" " p="$$" n=0
+    while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 && n < 64 )); do
+        self_chain+="$p "
+        p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null || true)
+        n=$((n + 1))
+    done
     local procs pid comm
-    for procs in "$base"/app-*.scope/cgroup.procs; do
+    {
+        [[ -d "$mgr/app.slice" ]] && find "$mgr/app.slice" -type d -name 'app-*.scope' 2>/dev/null
+        [[ -d "$mgr/session.slice/$DEEP_SESSION_UNIT" ]] && find "$mgr/session.slice/$DEEP_SESSION_UNIT" -type d 2>/dev/null
+    } | while IFS= read -r dir; do
+        procs="$dir/cgroup.procs"
         [[ -r "$procs" ]] || continue
         while IFS= read -r pid; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             [[ " $gui_pids " == *" $pid "* ]] && continue
+            [[ "$self_chain" == *" $pid "* ]] && continue
             comm=$(tr -d '\000\n' < "/proc/$pid/comm" 2>/dev/null || true)
-            [[ -n "$comm" ]] && printf "%s\t%s\n" "$pid" "$comm"
+            [[ -z "$comm" || "$comm" =~ $DEEP_SESSION_BOUND_IGNORE_RE ]] && continue
+            printf "%s\t%s\n" "$pid" "$comm"
         done < "$procs"
-    done | head -n 20
+    done | awk -F'\t' '!seen[$1]++' | head -n 20
 }
 
 deep_on_battery() {
@@ -464,17 +501,29 @@ deep_follow_enter() {
     local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-180}"
     local deadline=$(( $(date +%s) + follow_max ))
     local printed=0 total line state
-    while :; do
-        if [[ -f "$DEEP_LOG_FILE" ]]; then
-            total=$(wc -l < "$DEEP_LOG_FILE")
-            if (( total > printed )); then
-                while IFS= read -r line; do
-                    printf "  %s %s\n" "$(ui_badge_sync)" "${line#* }"
-                done < <(tail -n +"$(( printed + 1 ))" "$DEEP_LOG_FILE" | head -n "$(( total - printed ))")
-                printed=$total
-            fi
+    _deep_follow_print() {
+        [[ -f "$DEEP_LOG_FILE" ]] || return 0
+        total=$(wc -l < "$DEEP_LOG_FILE")
+        if (( total > printed )); then
+            while IFS= read -r line; do
+                printf "  %s %s\n" "$(ui_badge_sync)" "${line#* }"
+            done < <(tail -n +"$(( printed + 1 ))" "$DEEP_LOG_FILE" | head -n "$(( total - printed ))")
+            printed=$total
         fi
+    }
+    # B4: once the outcome is known, let the worker finish and print deep.log to EOF.
+    _deep_follow_drain() {
+        local i
+        for (( i = 0; i < 50; i++ )); do
+            systemctl --user is-active --quiet "${DEEP_TRANSITION_UNIT}.service" 2>/dev/null || break
+            sleep 0.1
+        done
+        _deep_follow_print
+    }
+    while :; do
+        _deep_follow_print
         if ! deep_state_exists; then
+            _deep_follow_drain
             local reason=""
             reason=$(jq -r '.reason // ""' "$DEEP_LAST_FILE" 2>/dev/null || true)
             ui_log_fail "Deep Server Mode was not entered; changes were rolled back${reason:+: $reason}."
@@ -483,10 +532,12 @@ deep_follow_enter() {
         state=$(deep_state_get state "")
         case "$state" in
             DEEP_SERVER)
+                _deep_follow_drain
                 ui_log_ok "DEEP_SERVER active. Desktop is stopped; run 'oma-server disable' to bring it back."
                 return 0
                 ;;
             DEEP_DEGRADED)
+                _deep_follow_drain
                 ui_log_fail "Deep transition failed and the desktop did not come back (DEEP_DEGRADED)." \
                     "Run 'oma-server disable' again, or '${DEEP_PANIC_HINT}'."
                 return 1
@@ -532,6 +583,11 @@ _deep_no_clients() {
 
 _deep_no_user_jobs() {
     [[ -z "$(systemctl --user list-jobs --no-legend 2>/dev/null)" ]]
+}
+
+# Units with a queued/running user job (first column of list-jobs is the job id).
+_deep_queued_units() {
+    systemctl --user list-jobs --no-legend 2>/dev/null | awk '{print $2}' | head -n 5 | paste -sd ' ' -
 }
 
 _deep_dm_inactive() {
@@ -645,13 +701,25 @@ deep_enter_worker() {
     else
         # e.g. org.freedesktop.systemd1.TransactionIsDestructive while a user start job
         # is still queued: wait for the job queue to drain, then retry once.
-        deep_log "uwsm stop refused ($(printf "%s" "$uwsm_out" | grep -o 'TransactionIsDestructive' | head -n 1 || true)); waiting for queued jobs and retrying once"
-        deep_wait_until 15 _deep_no_user_jobs || true
+        # B3: wait for the user job queue to drain (default 180s covers slow startup
+        # jobs; [deep] job_wait_seconds, 0..600), then retry once.
+        local job_wait queued=""
+        job_wait=$(config_get_scalar "$config_file" "deep" "job_wait_seconds" "180")
+        [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )) || job_wait=180
+        deep_log "uwsm stop refused ($(printf "%s" "$uwsm_out" | grep -o 'TransactionIsDestructive' | head -n 1 || true)); waiting up to ${job_wait}s for queued user jobs, then retrying once"
+        if ! deep_wait_until "$job_wait" _deep_no_user_jobs; then
+            queued=$(_deep_queued_units)
+            deep_log "user jobs still queued after ${job_wait}s: ${queued:-?}"
+        fi
         uwsm stop >/dev/null 2>&1 && uwsm_ok="true"
     fi
     if [[ "$uwsm_ok" != "true" ]] || ! deep_wait_until 15 _deep_session_down; then
         if deep_session_active; then
-            deep_rollback "uwsm stop failed; desktop still running"
+            if [[ -n "${queued:-}" ]]; then
+                deep_rollback "uwsm stop refused: a start job is still queued: ${queued}"
+            else
+                deep_rollback "uwsm stop failed; desktop still running"
+            fi
         else
             deep_log "uwsm stop incomplete and session is gone; running exit sequence"
             exec 201>&-
@@ -663,8 +731,8 @@ deep_enter_worker() {
     # Step 8: stop the greeter so nothing graphical is left.
     if [[ "$(config_get_bool "$config_file" "deep" "stop_display_manager" "true")" != "true" ]]; then
         deep_log "step 8/8: [deep] stop_display_manager = false, leaving the greeter running"
-        deep_state_set state '"DEEP_SERVER"'
         deep_log "DEEP_SERVER active (greeter kept)"
+        deep_state_set state '"DEEP_SERVER"'
         exec 201>&-
         return 0
     fi
@@ -682,8 +750,8 @@ deep_enter_worker() {
     deep_state_set dm_stopped true
     local ram_after; ram_after=$(deep_available_mb)
     [[ -n "$ram_after" ]] && deep_state_set ram_after_mb "$ram_after"
-    deep_state_set state '"DEEP_SERVER"'
     deep_log "DEEP_SERVER active (MemAvailable now ${ram_after:-?} MiB)"
+    deep_state_set state '"DEEP_SERVER"'
     exec 201>&-
     return 0
 }

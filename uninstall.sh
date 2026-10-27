@@ -59,21 +59,37 @@ if [[ -n "$DEEP_ROOT_PREFIX" ]]; then
        && "$(stat -c %u -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$(id -u)" ]] || {
         echo "OMA_SERVER_TEST_ROOT must be a real, user-owned absolute dir" >&2; exit 2; }
     for b in sudo pkexec; do
-        case "$(command -v "$b" 2>/dev/null)" in
-            /usr/bin/*|/bin/*|/usr/local/bin/*|/usr/sbin/*|/sbin/*) echo "OMA_SERVER_TEST_ROOT refused: real $b on PATH" >&2; exit 2 ;;
-        esac
+        t=$(type -t "$b" 2>/dev/null || true)
+        [[ -z "$t" ]] && continue
+        [[ "$t" == file ]] || { echo "OMA_SERVER_TEST_ROOT refused: $b is a $t" >&2; exit 2; }
+        r=$(realpath -e -- "$(type -P "$b")" 2>/dev/null) || { echo "OMA_SERVER_TEST_ROOT refused: $b unresolvable" >&2; exit 2; }
+        if [[ -u "$r" || -g "$r" || "$(stat -c %u -- "$r" 2>/dev/null)" == 0 ]]; then
+            echo "OMA_SERVER_TEST_ROOT refused: real $b reachable ($r)" >&2; exit 2
+        fi
     done
 fi
+# Never let an inherited shell function (BASH_FUNC_sudo%%) stand in for sudo/pkexec.
+unset -f sudo pkexec 2>/dev/null || true
 DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}/usr/local/lib/oma-server/deep-helper"
 DEEP_HELPER_DIR="${DEEP_HELPER_PATH%/*}"
 # /etc/sudoers.d is root-only (0750), so the rule itself cannot be seen. Detect the
 # install by the helper/dir or by the grant showing up in 'sudo -n -l -l'.
+# 'sudo -n -l' (no command) also lists an orphaned rule whose helper is gone.
+DEEP_SUDOERS_PATH="${DEEP_ROOT_PREFIX}/etc/sudoers.d/oma-server-deep"
 deep_installed="false"
+deep_rule_unknown="false"
 if [[ -e "$DEEP_HELPER_PATH" || -d "$DEEP_HELPER_DIR" ]]; then
     deep_installed="true"
-elif command -v sudo >/dev/null 2>&1 && \
-     sudo -n -l -l "$DEEP_HELPER_PATH" check 2>/dev/null | grep -q '!authenticate'; then
-    deep_installed="true"
+elif command -v sudo >/dev/null 2>&1; then
+    if sudo -n -l -l "$DEEP_HELPER_PATH" check 2>/dev/null | grep -q '!authenticate'; then
+        deep_installed="true"
+    elif sudo_list=$(sudo -n -l 2>/dev/null); then
+        if printf "%s\n" "$sudo_list" | grep -qF -- "$DEEP_HELPER_PATH"; then
+            deep_installed="true"
+        fi
+    else
+        deep_rule_unknown="true"
+    fi
 fi
 if [[ -f "$DEEP_STATE_FILE" ]]; then
     printf "[ FAIL ] Deep Server Mode is active (%s). Run 'oma-server disable' first; nothing was removed.\n" "$DEEP_STATE_FILE" >&2
@@ -93,6 +109,11 @@ if [[ "$deep_installed" == "true" ]]; then
         printf "[ FAIL ] Could not remove the Deep Server Mode helper; nothing else was removed.\n" >&2
         exit 1
     fi
+fi
+
+if [[ "$deep_installed" != "true" && "$deep_rule_unknown" == "true" ]]; then
+    printf "[ WARN ] Could not check for a leftover Deep Server Mode sudoers rule without a password.\n" >&2
+    printf "         If you ever ran 'oma-server deep-setup', remove it with: sudo rm -f %s\n" "$DEEP_SUDOERS_PATH" >&2
 fi
 
 # Decide config.toml fate up front, before anything is removed.

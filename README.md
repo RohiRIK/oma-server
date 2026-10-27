@@ -231,6 +231,8 @@ oma-server disable                              # from SSH or a TTY: brings the 
 
 > **Lockout risk without `--timeout`:** if SSH becomes unreachable (Wi-Fi drops, the IP changes, sshd dies) and nobody is at the machine, the desktop stays down. With the lid closed, the inhibitor keeps the machine awake: heat and battery drain if it goes into a bag. `[deep] require_ssh = true` (the default) refuses to enter unless `sshd.service` is active.
 
+> **Slow start jobs:** `uwsm stop` is refused (`TransactionIsDestructive`) while a user start job is still queued, e.g. a slow autostart unit right after login. Deep mode then waits for the user job queue to drain, up to `[deep] job_wait_seconds` (default 180 s, max 600, chosen to cover a ~3-minute startup job), and retries once. If it is still refused, it rolls back and names the queued unit.
+
 ## Configuration
 
 Configured via `~/.config/omarchy/plugins/server-mode/config.toml`:

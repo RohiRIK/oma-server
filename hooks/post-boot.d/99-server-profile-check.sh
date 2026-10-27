@@ -32,8 +32,15 @@ if [[ -f "$DEEP_DIR/deep.json" && ! -L "$DEEP_DIR/deep.json" ]]; then
         # Reconciles a boot_id change (reboot) and finishes DEEP_SERVER/DEEP_DEGRADED exits.
         # Run it outside the session cgroup so that stopping/restarting session units
         # can never take this cleanup (or the fresh session) down with it.
+        # Unique unit per boot and run (a leftover failed unit can never block the name),
+        # and clear old failed ones first.
+        boot_tag=$(tr -dc '0-9a-f' < /proc/sys/kernel/random/boot_id 2>/dev/null | head -c 8 || true)
+        postboot_unit="oma-server-deep-postboot-${boot_tag:-noboot}-$(date +%s)-$$"
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemctl --user reset-failed 'oma-server-deep-postboot*' >/dev/null 2>&1 || true
+        fi
         if command -v systemd-run >/dev/null 2>&1 && \
-           systemd-run --user --quiet --collect --unit=oma-server-deep-postboot \
+           systemd-run --user --quiet --collect --unit="$postboot_unit" \
                "$oma_cli" __deep-post-boot >/dev/null 2>&1; then
             :
         else
