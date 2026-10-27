@@ -133,7 +133,7 @@ start_inhibitor() {
     # Fallback strategy: Detached setsid session with SIGHUP ignored
     if [[ "$used_systemd_run" != "true" ]]; then
         if command -v setsid >/dev/null 2>&1; then
-            setsid -f bash -c "
+            setsid -f bash -p -c "
                 trap '' HUP
                 { exec 200>&-; } 2>/dev/null || true
                 exec systemd-inhibit \
@@ -453,7 +453,7 @@ start_timeout_guard() {
             --unit=oma-server-timer \
             --collect \
             --property=KillMode=process \
-            bash -c "
+            bash -p -c "
                 trap '' HUP
                 { exec 200>&-; } 2>/dev/null || true
                 sleep \"\$1\"
@@ -471,7 +471,7 @@ start_timeout_guard() {
     # Fallback strategy: setsid detached session with SIGHUP ignored
     if [[ "$used_systemd_run" != "true" || -z "$timer_pid" || "$timer_pid" == "0" ]]; then
         if command -v setsid >/dev/null 2>&1; then
-            setsid -f bash -c "
+            setsid -f bash -p -c "
                 trap '' HUP
                 { exec 200>&-; } 2>/dev/null || true
                 echo \$\$ > \"\$2/timeout.pid\"

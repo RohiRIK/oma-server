@@ -108,17 +108,65 @@ has_graphical_session() {
 
 CURRENT_UID="${UID:-$(id -u)}"
 
-# Waits (up to $1 seconds) until quickshell has an IPC socket again. Best effort: when
-# the runtime dir has no quickshell folder at all there is nothing to wait for.
+# Test/tuning knobs, validated before any arithmetic or sleep (Sam INFO-2: bash
+# arithmetic would evaluate a payload like 'a[$(cmd)]').
+_num_or() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf "%s" "$1" || printf "%s" "$2"; }
+enable_tries="${OMA_INSTALL_ENABLE_TRIES:-6}"
+[[ "$enable_tries" =~ ^[0-9]+$ ]] && (( 10#$enable_tries >= 1 && 10#$enable_tries <= 20 )) || enable_tries=6
+enable_tries=$(( 10#$enable_tries ))
+enable_step="$(_num_or "${OMA_INSTALL_ENABLE_BACKOFF:-1}" 1)"
+ipc_poll="$(_num_or "${OMA_INSTALL_IPC_POLL:-0.5}" 0.5)"
+ipc_wait="$(_num_or "${OMA_INSTALL_IPC_WAIT:-10}" 10)"
+
+live_shell_pids() {
+    pgrep -u "$CURRENT_UID" -x "quickshell" 2>/dev/null || true
+}
+
+# True when the running shell answers over IPC. Prefers 'omarchy-shell shell ping';
+# without it, a live quickshell pid must own a listening by-pid/<pid>/ipc.sock
+# (stale sockets of dead shells are ignored, by-id/* is never trusted on its own).
+shell_ipc_ok() {
+    if command -v omarchy-shell >/dev/null 2>&1; then
+        OMARCHY_SHELL_IPC_TIMEOUT=2s omarchy-shell shell ping >/dev/null 2>&1 && return 0
+    fi
+    local qs_dir="${XDG_RUNTIME_DIR:-/run/user/$CURRENT_UID}/quickshell" pid
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ -S "$qs_dir/by-pid/$pid/ipc.sock" ]] && return 0
+    done < <(live_shell_pids)
+    return 1
+}
+
+# Waits up to $1 seconds for a live shell that answers IPC.
 wait_for_shell_ipc() {
-    local max="${1:-10}" qs_dir="${XDG_RUNTIME_DIR:-/run/user/$CURRENT_UID}/quickshell" i
-    [[ -d "$qs_dir" ]] || return 0
-    for (( i = 0; i < max * 2; i++ )); do
-        if find "$qs_dir" -type s -name 'ipc.sock' -print -quit 2>/dev/null | grep -q .; then
-            return 0
-        fi
-        sleep "${OMA_INSTALL_IPC_POLL:-0.5}"
+    local max="${1:-10}" i n
+    n=$(awk -v m="$max" -v p="$ipc_poll" 'BEGIN { if (p <= 0) p = 0.5; printf "%d", m / p }')
+    for (( i = 0; i <= n; i++ )); do
+        [[ -n "$(live_shell_pids)" ]] && shell_ipc_ok && return 0
+        sleep "$ipc_poll"
     done
+    return 1
+}
+
+# N7: omarchy-restart-shell can leave no bar at all on a slow machine (its 'timeout 5
+# quickshell kill' loop starts the new shell while the old one still runs; the new one
+# refuses, then the old one exits). Make sure a shell is alive and answering, and
+# relaunch it inside the session if it is gone.
+ensure_shell_alive() {
+    local old_pids="$1"
+    wait_for_shell_ipc "$ipc_wait" && {
+        # An old instance that is still exiting may have answered; re-check once it settles.
+        sleep "$ipc_poll"
+        [[ -n "$(live_shell_pids)" ]] && return 0
+    }
+    if [[ -z "$(live_shell_pids)" ]] && command -v hyprctl >/dev/null 2>&1; then
+        ui_log_warn "omarchy-shell is not running after the restart; relaunching it."
+        local out
+        out=$(hyprctl dispatch 'hl.dsp.exec_cmd("omarchy-launch-shell")' 2>/dev/null || true)
+        [[ "$out" == *ok* ]] || hyprctl dispatch exec omarchy-launch-shell >/dev/null 2>&1 || true
+        wait_for_shell_ipc "$(awk -v w="$ipc_wait" 'BEGIN { print w * 2 }')" && return 0
+    fi
+    [[ -n "$old_pids" ]] && ui_log_warn "omarchy-shell did not come back answering IPC."
     return 1
 }
 
@@ -133,10 +181,12 @@ if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT
 
     if has_graphical_session && command -v omarchy-restart-shell >/dev/null 2>&1; then
         ui_log_info "Reloading omarchy-shell QML type cache..."
+        shell_pids_before="$(live_shell_pids | tr '\n' ' ')"
         if ! omarchy-restart-shell >/dev/null 2>&1; then
             omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
             sleep 0.6
         fi
+        ensure_shell_alive "$shell_pids_before" || true
     else
         if ! has_graphical_session; then
             ui_log_info "No graphical session detected (e.g. SSH); not restarting omarchy-shell, rescanning plugins instead."
@@ -154,9 +204,7 @@ if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT
         # or omarchy-restart-shell), which shows up as an IPC timeout or
         # 'QLocalSocket::PeerClosedError'. Wait for the quickshell IPC socket, then
         # retry with a growing backoff (1+2+3+4+5 s by default, ~15 s in total).
-        enable_tries="${OMA_INSTALL_ENABLE_TRIES:-6}"
-        enable_step="${OMA_INSTALL_ENABLE_BACKOFF:-1}"
-        wait_for_shell_ipc 10
+        wait_for_shell_ipc "$ipc_wait" || true
         for (( _attempt = 1; _attempt <= enable_tries; _attempt++ )); do
             enable_rc=0
             enable_out=$(OMARCHY_SHELL_IPC_TIMEOUT=5s omarchy plugin enable rohirik.oma-server --section right 2>&1) || enable_rc=$?
@@ -165,7 +213,7 @@ if pgrep -u "$CURRENT_UID" -x "quickshell" >/dev/null 2>&1 || pgrep -u "$CURRENT
             (( enable_rc == 0 )) && break
             (( _attempt < enable_tries )) || break
             if [[ "$enable_out" == *PeerClosedError* || "$enable_out" == *"timed out"* || "$enable_out" == *"Socket Error"* ]]; then
-                wait_for_shell_ipc 10
+                wait_for_shell_ipc "$ipc_wait" || true
             fi
             sleep "$(awk -v a="$_attempt" -v s="$enable_step" 'BEGIN { printf "%.2f", a * s }')"
         done

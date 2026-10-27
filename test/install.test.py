@@ -40,6 +40,10 @@ class InstallerTests(unittest.TestCase):
         # Pretend a shell instance is running when OMA_TEST_SHELL_RUNNING=1
         write_executable(self.bin_dir / "pgrep", f"""#!/usr/bin/env bash
 if [[ "$*" == *"quickshell"* || "$*" == *"omarchy-shell"* ]]; then
+    if [[ "${{OMA_TEST_SHELL_STATEFUL:-0}}" == "1" ]]; then
+        [[ -s "{self.base}/shell-pids" ]] && {{ cat "{self.base}/shell-pids"; exit 0; }}
+        exit 1
+    fi
     [[ "${{OMA_TEST_SHELL_RUNNING:-0}}" == "1" ]] && {{ echo 4242; exit 0; }}
     exit 1
 fi
@@ -52,11 +56,25 @@ exit 0
         write_executable(self.bin_dir / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
         write_executable(self.bin_dir / "omarchy-restart-shell", f"""#!/usr/bin/env bash
 echo "restart-shell" >> "{log}"
+if [[ "${{OMA_TEST_SHELL_STATEFUL:-0}}" == "1" ]]; then
+    # kill mode: the upstream race leaves no shell at all
+    if [[ "${{OMA_TEST_RESTART_KILLS_SHELL:-0}}" == "1" ]]; then : > "{self.base}/shell-pids"; else echo 4343 > "{self.base}/shell-pids"; fi
+fi
+exit 0
+""")
+        write_executable(self.bin_dir / "hyprctl", f"""#!/usr/bin/env bash
+echo "hyprctl $*" >> "{log}"
+if [[ "$*" == *omarchy-launch-shell* ]]; then echo 5555 > "{self.base}/shell-pids"; echo ok; fi
 exit 0
 """)
         # Like the real tools, fail when OMARCHY_PATH is unset (plain SSH)
         write_executable(self.bin_dir / "omarchy-shell", f"""#!/usr/bin/env bash
 [[ -n "${{OMARCHY_PATH:-}}" ]] || {{ echo "omarchy-shell: OMARCHY_PATH is not set" >&2; exit 1; }}
+if [[ "$1 $2" == "shell ping" ]]; then
+    [[ "${{OMA_TEST_PING_FAIL:-0}}" == "1" ]] && exit 1
+    if [[ "${{OMA_TEST_SHELL_STATEFUL:-0}}" == "1" ]]; then [[ -s "{self.base}/shell-pids" ]] || exit 1; fi
+    exit 0
+fi
 echo "omarchy-shell $* [OMARCHY_PATH=$OMARCHY_PATH]" >> "{log}"
 exit 0
 """)
@@ -66,6 +84,9 @@ if [[ -z "${{OMARCHY_PATH:-}}" ]]; then
     exit 1
 fi
 echo "omarchy $* [OMARCHY_PATH=$OMARCHY_PATH]" >> "{log}"
+if [[ "$1 $2" == "plugin enable" && -n "${{OMA_TEST_SOCK_PROBE:-}}" ]]; then
+    [[ -S "$OMA_TEST_SOCK_PROBE" ]] && echo "sock=yes" >> "{log}" || echo "sock=no" >> "{log}"
+fi
 if [[ "$1 $2" == "plugin enable" && "${{OMA_TEST_ENABLE_FAIL:-0}}" == "1" ]]; then
     echo "error: omarchy-shell IPC timed out" >&2
     exit 1
@@ -94,6 +115,7 @@ exit 0
             "XDG_RUNTIME_DIR": str(self.base / "xdg-runtime"),
             "OMA_INSTALL_ENABLE_BACKOFF": "0.01",
             "OMA_INSTALL_IPC_POLL": "0.01",
+            "OMA_INSTALL_IPC_WAIT": "0.3",
         }
         if graphical:
             env["WAYLAND_DISPLAY"] = "wayland-1"
@@ -173,6 +195,58 @@ exit 0
         self.assertNotEqual(res.returncode, 0, res.plain)
         self.assertEqual(len(self.enable_calls()), 6)
         self.assertIn("PeerClosedError", res.plain)
+
+    def test_n7_restart_that_kills_the_shell_relaunches_it(self):
+        (self.base / "shell-pids").write_text("4242\n")
+        res = self.run_script("install.sh", graphical=True, extra_env={
+            "OMA_TEST_SHELL_STATEFUL": "1", "OMA_TEST_RESTART_KILLS_SHELL": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("relaunching it", res.plain)
+        self.assertIn('hyprctl dispatch hl.dsp.exec_cmd("omarchy-launch-shell")', self.calls())
+        self.assertEqual((self.base / "shell-pids").read_text().strip(), "5555")
+        self.assertIn("omarchy plugin enable rohirik.oma-server", self.calls())
+
+    def test_n7_healthy_restart_does_not_relaunch(self):
+        (self.base / "shell-pids").write_text("4242\n")
+        res = self.run_script("install.sh", graphical=True, extra_env={"OMA_TEST_SHELL_STATEFUL": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("restart-shell", self.calls())
+        self.assertNotIn("omarchy-launch-shell", self.calls())
+
+    def test_n6_stale_socket_is_not_trusted(self):
+        import socket, threading, time
+        qs = self.base / "xdg-runtime/quickshell"
+        stale = qs / "by-id/dead"
+        stale.mkdir(parents=True)
+        s1 = socket.socket(socket.AF_UNIX); s1.bind(str(stale / "ipc.sock")); s1.close()   # stale, nobody listening
+        live = qs / "by-id/live"
+        live.mkdir(parents=True)
+        (qs / "by-pid").mkdir()
+        (qs / "by-pid/4242").symlink_to(live)
+        s2 = socket.socket(socket.AF_UNIX)
+        t = threading.Timer(0.5, lambda: s2.bind(str(live / "ipc.sock")))
+        t.start()
+        try:
+            res = self.run_script("install.sh", extra_env={
+                "OMA_TEST_SHELL_RUNNING": "1", "OMA_TEST_PING_FAIL": "1", "OMA_INSTALL_IPC_WAIT": "5",
+                "OMA_INSTALL_IPC_POLL": "0.05", "OMA_TEST_SOCK_PROBE": str(qs / "by-pid/4242/ipc.sock")})
+        finally:
+            t.cancel(); s2.close()
+        self.assertEqual(res.returncode, 0, res.plain)
+        first = [l for l in self.calls().splitlines() if l.startswith("sock=")][0]
+        self.assertEqual(first, "sock=yes", "must wait for the live shell's by-pid socket, not any ipc.sock")
+
+    def test_info2_tuning_vars_are_validated(self):
+        marker = self.base / "pwned"
+        payload = f"a[$(touch {marker})]"
+        res = self.run_script("install.sh", extra_env={
+            "OMA_TEST_SHELL_RUNNING": "1", "OMA_TEST_ENABLE_FAIL_TIMES": "1",
+            "OMA_INSTALL_ENABLE_TRIES": payload, "OMA_INSTALL_ENABLE_BACKOFF": payload,
+            "OMA_INSTALL_IPC_POLL": payload, "OMA_INSTALL_IPC_WAIT": "0.3"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertFalse(marker.exists(), "payload must never be evaluated")
+        src = (ROOT / "install.sh").read_text()
+        self.assertIn('[[ "$enable_tries" =~ ^[0-9]+$ ]]', src)
 
     def test_install_reports_widget_enable_failure_honestly(self):
         res = self.run_script(

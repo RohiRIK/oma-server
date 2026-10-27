@@ -1340,10 +1340,11 @@ echo "oma-server $*" >> "{self.log}"
         res = self.cli("status", extra_env=env)
         self.assertEqual(res.returncode, 0, res.plain)
         self.assertFalse(marker.exists())
-        # Run with plain 'bash' (no -p), the in-script guard still refuses it.
+        # Run as plain 'bash uninstall.sh', it re-execs itself under bash -p first (N8),
+        # so the function is never imported there either.
         res2 = self.run_script("uninstall.sh", extra=env)
-        self.assertEqual(res2.returncode, 2, res2.stdout + res2.stderr)
-        self.assertIn("sudo is a function", res2.stderr)
+        self.assertNotIn("sudo is a function", res2.stderr)
+        self.assertFalse(marker.exists())
 
     def test_n1_exported_function_dropped_outside_test_mode(self):
         out = subprocess.run(
@@ -1520,6 +1521,107 @@ echo "oma-server $*" >> "{self.log}"
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(marker.exists())
         self.assertIn("oma-server __deep-post-boot", self.calls())
+
+
+class FollowUpFixTests4(DeepSandbox):
+    """PR #3 fourth VM pass: Quill N5-N8 + window descendants, Sam INFO-1..3."""
+
+    def cgroup(self):
+        cg = self.base / "cgroup"
+        uid = os.getuid()
+        wm = cg / f"user.slice/user-{uid}.slice/user@{uid}.service/session.slice/wayland-wm@hyprland.desktop.service"
+        wm.mkdir(parents=True)
+        return cg, wm
+
+    def spawn(self, *argv):
+        pr = subprocess.Popen(list(argv))
+        self.addCleanup(lambda: (pr.kill(), pr.wait()))
+        return pr
+
+    def children(self, pid):
+        import time
+        for _ in range(50):
+            out = subprocess.run(["/usr/bin/pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+            if out:
+                return [int(x) for x in out]
+            time.sleep(0.05)
+        self.fail(f"no children of {pid}")
+
+    # ---- N5: exited pids: no errors, not listed ----
+    def test_n5_exited_pid_is_silent_and_not_listed(self):
+        self.install_helper()
+        cg, wm = self.cgroup()
+        gone = subprocess.Popen(["true"]); gone.wait()
+        agent = self.spawn("tail", "-f", "/dev/null")
+        (wm / "cgroup.procs").write_text(f"{gone.pid}\n{agent.pid}\n")
+        res = self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertNotIn("No such file", res.plain)
+        self.assertNotIn(f"pid {gone.pid})", res.plain)
+        self.assertIn(f"tail (pid {agent.pid})", res.plain)
+
+    def test_n5_helper_check_guards_unreadable_cmdline(self):
+        src = (ROOT / "lib/deep.sh").read_text()
+        body = src.split("_deep_proc_is_omarchy_helper() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('[[ -r "/proc/$pid/cmdline" ]] || return 1', body)
+        self.assertIn("} 2>/dev/null", body)
+
+    # ---- cosmetic: descendants of listed windows are not repeated ----
+    def test_window_descendants_not_listed(self):
+        self.install_helper()
+        cg, wm = self.cgroup()
+        fake_foot = self.base / "foot"
+        shutil.copy(shutil.which("bash"), fake_foot)
+        foot = self.spawn(str(fake_foot), "-c", "sleep 30 & wait")
+        kid = self.children(foot.pid)[0]
+        agent = self.spawn("tail", "-f", "/dev/null")
+        (wm / "cgroup.procs").write_text(f"{kid}\n{agent.pid}\n")
+        self.set_clients([{"class": "foot", "title": "t", "pid": foot.pid}])
+        res = self.cli_tty("enable", "--deep", "--close-apps", answers="yes\n",
+                           extra_env={"OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertNotIn(f"(pid {kid})", res.plain)
+        self.assertIn(f"tail (pid {agent.pid})", res.plain)
+
+    # ---- N8: entrypoints re-exec under bash -p when run as `bash file` ----
+    def test_n8_hook_run_as_bash_file_drops_functions(self):
+        marker = self.base / "hijacked"
+        self.write_deep_state(state="DEEP_SERVER")
+        write_executable(self.bin / "oma-server", f"""#!/usr/bin/env bash
+echo "oma-server $*" >> "{self.log}"
+""")
+        env = self.env({"BASH_FUNC_systemd-run%%": f"() {{  touch {marker}; }}",
+                        "BASH_FUNC_jq%%": f"() {{  touch {marker}; }}",
+                        "BASH_FUNC_flock%%": f"() {{  touch {marker}; }}"})
+        res = subprocess.run(["bash", str(ROOT / "hooks/post-boot.d/99-server-profile-check.sh")],
+                             capture_output=True, text=True, env=env, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(marker.exists(), "exported functions must not run in the hook")
+        self.assertIn("oma-server __deep-post-boot", self.calls())
+
+    def test_n8_cli_and_uninstall_run_as_bash_file_reexec(self):
+        real = shutil.which("sudo", path="/usr/bin:/bin:/usr/local/bin")
+        if not real:
+            self.skipTest("no real sudo on this host")
+        env = self.env({"PATH": f"/usr/bin:/bin:{self.bin}", "BASH_FUNC_type%%": "() {  echo file; }",
+                        "BASH_FUNC_realpath%%": f"() {{  echo {self.root}; }}",
+                        "BASH_FUNC_stat%%": "() {  echo %d; }" % os.getuid()})
+        for argv in (["bash", str(OMA_BIN), "status"], ["bash", str(ROOT / "uninstall.sh")]):
+            res = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(res.returncode, 2, f"{argv}: {res.stdout}{res.stderr}")
+            self.assertIn("real sudo reachable", res.stderr)
+
+    def test_n8_reexec_line_is_first_body_line(self):
+        line = '[[ $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"'
+        for f in ("bin/oma-server", "bin/omarchy-server-mode", "uninstall.sh", "hooks/post-boot.d/99-server-profile-check.sh"):
+            body = [l for l in (ROOT / f).read_text().splitlines()[1:] if l.strip() and not l.startswith("#")]
+            self.assertEqual(body[0], line, f)
+
+    # ---- Sam INFO-3: fallback children run under bash -p ----
+    def test_info3_transition_children_use_bash_p(self):
+        src = (ROOT / "lib/transition.sh").read_text()
+        self.assertNotIn('bash -c "', src)
+        self.assertEqual(src.count('bash -p -c "'), 3)
 
 
 if __name__ == "__main__":

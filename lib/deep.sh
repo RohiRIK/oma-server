@@ -310,26 +310,31 @@ DEEP_SESSION_BOUND_SHELL_RE='^(quickshell|qs|omarchy-shell|omarchy-launch-shell|
 # or oma-server plugin directory.
 _deep_proc_is_omarchy_helper() {
     local pid="$1" arg i=0 dir
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
     local -a dirs=(/usr/share/omarchy/ /usr/local/bin/omarchy- /usr/bin/omarchy-
+                   /usr/local/lib/try-omarchy/ /usr/local/bin/host-window
                    "${HOME:-/nonexistent}/.local/share/omarchy/" "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/omarchy/")
     [[ -n "${OMARCHY_PATH:-}" ]] && dirs+=("${OMARCHY_PATH%/}/")
-    while IFS= read -r -d '' arg && (( i < 2 )); do
-        for dir in "${dirs[@]}"; do
-            [[ "$arg" == "$dir"* ]] && return 0
-        done
-        i=$((i + 1))
-    done < "/proc/$pid/cmdline" 2>/dev/null
+    {
+        while IFS= read -r -d '' arg && (( i < 2 )); do
+            for dir in "${dirs[@]}"; do
+                [[ "$arg" == "$dir"* ]] && return 0
+            done
+            i=$((i + 1))
+        done < "/proc/$pid/cmdline"
+    } 2>/dev/null
     return 1
 }
 
-# True when an ancestor (walking PPid up to Hyprland or pid 1) is the bar/shell or an
-# Omarchy helper script.
+# True when an ancestor (walking PPid up to Hyprland or pid 1) is the bar/shell, an
+# Omarchy helper script, or one of the GUI windows already listed ($2).
 _deep_proc_under_shell() {
-    local p="$1" n=0 comm
+    local p="$1" gui_pids="${2:-}" n=0 comm
     while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 && n < 64 )); do
         p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null || true)
         [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )) || return 1
-        comm=$(tr -d '\000\n' < "/proc/$p/comm" 2>/dev/null || true)
+        [[ " $gui_pids " == *" $p "* ]] && return 0
+        comm=$(tr -d '\000\n' 2>/dev/null < "/proc/$p/comm" || true)
         [[ "$comm" == "Hyprland" || "$comm" == "hyprland" || "$comm" == "systemd" ]] && return 1
         [[ "$comm" =~ $DEEP_SESSION_BOUND_SHELL_RE ]] && return 0
         _deep_proc_is_omarchy_helper "$p" && return 0
@@ -365,10 +370,13 @@ deep_list_session_bound_procs() {
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             [[ " $gui_pids " == *" $pid "* ]] && continue
             [[ "$self_chain" == *" $pid "* ]] && continue
-            comm=$(tr -d '\000\n' < "/proc/$pid/comm" 2>/dev/null || true)
+            [[ -r "/proc/$pid/comm" ]] || continue
+            comm=$(tr -d '\000\n' 2>/dev/null < "/proc/$pid/comm" || true)
             [[ -z "$comm" || "$comm" =~ $DEEP_SESSION_BOUND_IGNORE_RE ]] && continue
             _deep_proc_is_omarchy_helper "$pid" && continue
-            _deep_proc_under_shell "$pid" && continue
+            _deep_proc_under_shell "$pid" "$gui_pids" && continue
+            # N5: never list a pid that exited while we were looking at it.
+            [[ -d "/proc/$pid" ]] || continue
             printf "%s\t%s\n" "$pid" "$comm"
         done < "$procs"
     done | awk -F'\t' '!seen[$1]++'
