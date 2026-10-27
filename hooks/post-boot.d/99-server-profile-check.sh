@@ -30,7 +30,15 @@ if [[ -f "$DEEP_DIR/deep.json" && ! -L "$DEEP_DIR/deep.json" ]]; then
     [[ -z "$oma_cli" && -x "$HOME/.local/bin/oma-server" ]] && oma_cli="$HOME/.local/bin/oma-server"
     if [[ -n "$oma_cli" ]]; then
         # Reconciles a boot_id change (reboot) and finishes DEEP_SERVER/DEEP_DEGRADED exits.
-        "$oma_cli" __deep-post-boot >/dev/null 2>&1 || true
+        # Run it outside the session cgroup so that stopping/restarting session units
+        # can never take this cleanup (or the fresh session) down with it.
+        if command -v systemd-run >/dev/null 2>&1 && \
+           systemd-run --user --quiet --collect --unit=oma-server-deep-postboot \
+               "$oma_cli" __deep-post-boot >/dev/null 2>&1; then
+            :
+        else
+            "$oma_cli" __deep-post-boot >/dev/null 2>&1 || true
+        fi
     fi
     exit 0
 fi

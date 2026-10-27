@@ -14,6 +14,27 @@ set -euo pipefail
 # (sandboxed tests). The sudoers content always names the real helper path, so a
 # relocated helper is never covered by the grant.
 DEEP_ROOT_PREFIX="${OMA_SERVER_TEST_ROOT:-}"
+# S1: the prefix is test-only. Refuse it unless explicitly in test mode, as root,
+# for anything but a real, user-owned, symlink-free absolute dir, or when a real
+# sudo/pkexec would be used with it.
+deep_guard_test_root() {
+    [[ -n "$DEEP_ROOT_PREFIX" ]] || return 0
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] || { echo "OMA_SERVER_TEST_ROOT is test-only (set OMA_SERVER_TEST_MODE=1)" >&2; exit 2; }
+    [[ "$(id -u)" -ne 0 ]] || { echo "OMA_SERVER_TEST_ROOT refused as root" >&2; exit 2; }
+    [[ "$DEEP_ROOT_PREFIX" == /* && -d "$DEEP_ROOT_PREFIX" \
+       && "$(realpath -e -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$DEEP_ROOT_PREFIX" \
+       && "$(stat -c %u -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$(id -u)" ]] || {
+        echo "OMA_SERVER_TEST_ROOT must be a real, user-owned absolute dir" >&2; exit 2; }
+    local b
+    for b in sudo pkexec; do
+        case "$(command -v "$b" 2>/dev/null)" in
+            /usr/bin/*|/bin/*|/usr/local/bin/*|/usr/sbin/*|/sbin/*)
+                echo "OMA_SERVER_TEST_ROOT refused: real $b on PATH" >&2; exit 2 ;;
+        esac
+    done
+    return 0
+}
+deep_guard_test_root
 DEEP_HELPER_REAL_PATH="/usr/local/lib/oma-server/deep-helper"
 DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}${DEEP_HELPER_REAL_PATH}"
 DEEP_HELPER_DIR="${DEEP_HELPER_PATH%/*}"
@@ -29,6 +50,36 @@ DEEP_TRANSITION_UNIT="oma-server-deep-transition"
 DEEP_USER_TIMER_UNIT="oma-server-timer"
 DEEP_POLL="${OMA_DEEP_POLL_INTERVAL:-1}"
 DEEP_PANIC_HINT="sudo systemctl start display-manager"
+# S2: the helper source is pinned by hash (test/deep.test.py keeps this in sync);
+# the sudoers rule is generated here, never trusted from the user-writable plugin dir.
+DEEP_HELPER_SHA256="988bfab6eab98312683804088cad13c3917906f436406834a9ee72f5684f7db1"
+DEEP_HELPER_VERBS=(check dm-stop dm-start dm-restart inhibit-start inhibit-stop revert-disarm exit)
+
+# Prints the exact sudoers file deep-setup installs.
+deep_sudoers_expected() {
+    local h="$DEEP_HELPER_REAL_PATH" v
+    printf '%s\n' \
+        "# /etc/sudoers.d/oma-server-deep -- installed only by \`oma-server deep-setup\` (opt-in)." \
+        "# oma-server Deep Server Mode stops and restarts the graphical session, so the way back runs from SSH," \
+        "# a TTY, or a root timer with no terminal or polkit agent to carry a prompt. Every verb is spelled out;" \
+        "# revert-arm takes digits only and the helper revalidates them (5..604920)." \
+        "# Remove with: oma-server deep-setup --remove"
+    printf '%%wheel ALL=(root) NOPASSWD: %s %s, \\\n' "$h" "${DEEP_HELPER_VERBS[0]}"
+    for v in "${DEEP_HELPER_VERBS[@]:1}"; do
+        printf '    %s %s, \\\n' "$h" "$v"
+    done
+    printf '    %s ^revert-arm [1-9][0-9]{0\\,5}$\n' "$h"
+}
+
+# S3: a path must be root-owned (test mode: the user) and not group/other-writable.
+_deep_path_safe() {
+    local path="$1" want_uid=0 mode
+    [[ -n "$DEEP_ROOT_PREFIX" ]] && want_uid="$(id -u)"
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    [[ "$(stat -c %u -- "$path" 2>/dev/null)" == "$want_uid" ]] || return 1
+    mode=$(stat -c %a -- "$path" 2>/dev/null) || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
 
 # -----------------------------------------------------------------------------
 # 1. State file (XDG state dir, not /run/user: survives the user manager)
@@ -129,15 +180,22 @@ deep_available_mb() {
 # -----------------------------------------------------------------------------
 # 2. Root helper access
 # -----------------------------------------------------------------------------
+# The sudoers file is NOT checked here: /etc/sudoers.d is 0750 root on Arch, so a
+# user cannot see it. The grant itself is checked by deep_grant_ok (sudo -n -l -l).
 deep_helper_installed() {
     [[ -f "$DEEP_HELPER_PATH" && ! -L "$DEEP_HELPER_PATH" && -x "$DEEP_HELPER_PATH" ]] || return 1
-    [[ -f "$DEEP_SUDOERS_PATH" && ! -L "$DEEP_SUDOERS_PATH" ]] || return 1
-    # Real installs must be root-owned; sandboxed tests (OMA_SERVER_TEST_ROOT) run as the user.
-    local want_uid=0
-    [[ -n "$DEEP_ROOT_PREFIX" ]] && want_uid="$(id -u)"
-    [[ "$(stat -c %u "$DEEP_HELPER_PATH" 2>/dev/null)" == "$want_uid" ]] || return 1
-    [[ "$(stat -c %u "$DEEP_HELPER_DIR" 2>/dev/null)" == "$want_uid" ]] || return 1
+    _deep_path_safe "$DEEP_HELPER_PATH" || return 1
+    _deep_path_safe "$DEEP_HELPER_DIR" || return 1
+    # Parents of the helper dir must not be writable by others either.
+    _deep_path_safe "${DEEP_HELPER_DIR%/*}" || return 1
+    _deep_path_safe "${DEEP_ROOT_PREFIX}/usr/local" || return 1
     return 0
+}
+
+# True when anything of the deep-mode root footprint is visible to the user.
+deep_footprint_visible() {
+    [[ -e "$DEEP_HELPER_PATH" || -d "$DEEP_HELPER_DIR" ]] && return 0
+    deep_grant_ok
 }
 
 # Omarchy-style probe (bin/omarchy-dns): lists the grant, runs and prompts nothing.
@@ -192,15 +250,31 @@ deep_session_active() {
     systemctl --user is-active --quiet "$DEEP_SESSION_UNIT" 2>/dev/null
 }
 
+# Active OR still starting: a fresh session must never be torn down.
+deep_session_present() {
+    local st
+    st=$(systemctl --user is-active "$DEEP_SESSION_UNIT" 2>/dev/null || true)
+    [[ "$st" == "active" || "$st" == "activating" || "$st" == "reloading" ]]
+}
+
 deep_dm_active() {
     systemctl is-active --quiet display-manager.service 2>/dev/null
 }
 
 # Prints "class<TAB>title<TAB>pid" per open window. Fails if Hyprland is unreachable.
+# Returns 1 (IPC error) unless hyprctl answered with a JSON array; retries a few times
+# because Hyprland's IPC can time out while it is busy closing windows.
 deep_list_gui_clients() {
-    local out
-    out=$(run_with_timeout 5 hyprctl clients -j 2>/dev/null) || return 1
-    printf "%s" "$out" | jq -r 'if type == "array" then .[] | "\(.class)\t\(.title)\t\(.pid)" else empty end' 2>/dev/null
+    local out attempt
+    for attempt in 1 2 3; do
+        if out=$(run_with_timeout 5 hyprctl clients -j 2>/dev/null) && \
+           printf "%s" "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            printf "%s" "$out" | jq -r '.[] | "\(.class)\t\(.title)\t\(.pid)"'
+            return 0
+        fi
+        (( attempt < 3 )) && sleep "$DEEP_POLL"
+    done
+    return 1
 }
 
 # Non-GUI processes in app-*.scope cgroups (tmux, agents, ...) die with the session.
@@ -368,8 +442,10 @@ deep_enter_transaction() {
     # Detach the rest: a terminal inside Hyprland dies when the session stops.
     local -a setenv=()
     local var
-    for var in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY OMARCHY_PATH XDG_STATE_HOME XDG_CONFIG_HOME \
-               OMA_SERVER_TEST_ROOT OMA_DEEP_POLL_INTERVAL; do
+    local -a fwd=(HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY OMARCHY_PATH XDG_STATE_HOME XDG_CONFIG_HOME OMA_DEEP_POLL_INTERVAL)
+    # The test-only prefix is forwarded only in test mode (S1).
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)
+    for var in "${fwd[@]}"; do
         [[ -n "${!var:-}" ]] && setenv+=("--setenv=${var}=${!var}")
     done
     systemctl --user reset-failed "${DEEP_TRANSITION_UNIT}.service" >/dev/null 2>&1 || true
@@ -443,10 +519,19 @@ _deep_session_down() {
     ! systemctl --user is-active --quiet graphical-session.target 2>/dev/null
 }
 
+_DEEP_LAST_CLIENTS_ERR=""
 _deep_no_clients() {
     local c
-    c=$(deep_list_gui_clients 2>/dev/null) || return 1
+    if ! c=$(deep_list_gui_clients 2>/dev/null); then
+        _DEEP_LAST_CLIENTS_ERR="ipc"
+        return 1
+    fi
+    _DEEP_LAST_CLIENTS_ERR=""
     [[ -z "$c" ]]
+}
+
+_deep_no_user_jobs() {
+    [[ -z "$(systemctl --user list-jobs --no-legend 2>/dev/null)" ]]
 }
 
 _deep_dm_inactive() {
@@ -539,8 +624,13 @@ deep_enter_worker() {
         omarchy-hyprland-window-close-all >/dev/null 2>&1 || true
         sleep "$DEEP_POLL"
         if ! deep_wait_until 10 _deep_no_clients; then
-            local left; left=$(deep_list_gui_clients 2>/dev/null | cut -f1,2 | tr '\t\n' ': ' || true)
-            deep_rollback "windows did not close (save dialog?): ${left}"
+            local left=""
+            if left=$(deep_list_gui_clients 2>/dev/null); then
+                left=$(printf "%s" "$left" | cut -f1,2 | tr '\t\n' ': ')
+                deep_rollback "windows did not close (save dialog?): ${left}"
+            else
+                deep_rollback "could not verify windows closed (hyprctl IPC error)"
+            fi
             return 1
         fi
     else
@@ -549,7 +639,17 @@ deep_enter_worker() {
 
     # Step 7: stop the uwsm session (Omarchy's own logout path).
     deep_log "step 7/8: stopping the uwsm session"
-    if ! uwsm stop >/dev/null 2>&1 || ! deep_wait_until 15 _deep_session_down; then
+    local uwsm_ok="false" uwsm_out=""
+    if uwsm_out=$(uwsm stop 2>&1); then
+        uwsm_ok="true"
+    else
+        # e.g. org.freedesktop.systemd1.TransactionIsDestructive while a user start job
+        # is still queued: wait for the job queue to drain, then retry once.
+        deep_log "uwsm stop refused ($(printf "%s" "$uwsm_out" | grep -o 'TransactionIsDestructive' | head -n 1 || true)); waiting for queued jobs and retrying once"
+        deep_wait_until 15 _deep_no_user_jobs || true
+        uwsm stop >/dev/null 2>&1 && uwsm_ok="true"
+    fi
+    if [[ "$uwsm_ok" != "true" ]] || ! deep_wait_until 15 _deep_session_down; then
         if deep_session_active; then
             deep_rollback "uwsm stop failed; desktop still running"
         else
@@ -615,20 +715,29 @@ deep_exit_transaction() {
     wait_s=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
     [[ "$wait_s" =~ ^[0-9]+$ ]] && (( wait_s >= 1 && wait_s <= 600 )) || wait_s=45
 
+    local from_state; from_state=$(deep_state_get state "DEEP_SERVER")
     deep_state_set state '"DEEP_EXITING"'
-    deep_log "exit: restoring the desktop"
-    ui_log_sync "Restoring desktop: DEEP_SERVER -> HOST_LAPTOP"
+    deep_log "exit: restoring the desktop (from ${from_state})"
+    ui_log_sync "Restoring desktop: ${from_state} -> HOST_LAPTOP"
 
-    # Clear leftovers that make uwsm refuse to start (omarchy#9589).
-    if systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then
-        systemctl --user stop graphical-session.target wayland-session@hyprland.desktop.target >/dev/null 2>&1 || true
-    fi
-    systemctl --user reset-failed 'wayland-wm@*' >/dev/null 2>&1 || true
-
-    local back="false"
-    if deep_session_active; then
-        back="true"
+    local back="false" fail_reason=""
+    if deep_session_present; then
+        # The desktop is already back (root backup timer, manual login): never stop
+        # graphical-session.target here, it belongs to the fresh session.
+        deep_log "exit: session already present, finishing cleanup only"
+        if deep_wait_for_desktop "$wait_s"; then
+            back="true"
+        else
+            fail_reason="session did not become active within ${wait_s}s"
+        fi
     else
+        # Clear leftovers that make uwsm refuse to start (omarchy#9589), only while
+        # no session exists.
+        if systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then
+            systemctl --user stop graphical-session.target wayland-session@hyprland.desktop.target >/dev/null 2>&1 || true
+        fi
+        systemctl --user reset-failed 'wayland-wm@*' >/dev/null 2>&1 || true
+
         # A running greeter (stop_display_manager = false, or a failed earlier exit) only
         # autologins again on a fresh start, so restart it; otherwise start it.
         local dm_verb="dm-start"
@@ -642,11 +751,16 @@ deep_exit_transaction() {
                 back="true"
             else
                 deep_log "exit: no Hyprland yet, restarting display-manager once"
-                if deep_helper_root dm-restart >/dev/null && deep_wait_for_desktop "$wait_s"; then
+                if ! deep_helper_root dm-restart >/dev/null; then
+                    fail_reason="dm-restart failed"
+                elif deep_wait_for_desktop "$wait_s"; then
                     back="true"
+                else
+                    fail_reason="desktop did not come back within ${wait_s}s (after one dm-restart)"
                 fi
             fi
         else
+            fail_reason="${dm_verb} failed"
             deep_log "exit: ${dm_verb} failed"
         fi
     fi
@@ -661,7 +775,7 @@ deep_exit_transaction() {
             ui_log_info "Display manager is up without autologin: log in at the screen."
         else
             deep_state_set state '"DEEP_DEGRADED"'
-            deep_log "exit: DEEP_DEGRADED (desktop did not come back within ${wait_s}s)"
+            deep_log "exit: DEEP_DEGRADED (${fail_reason:-desktop did not come back})"
             ui_log_fail "Desktop did not come back. Log in at the screen, or run 'oma-server disable' again." \
                 "Panic: ${DEEP_PANIC_HINT}. The sleep/lid inhibitor is kept."
             exec 201>&-
@@ -743,6 +857,20 @@ deep_setup() {
         return 1
     fi
     [[ -f "$helper_src" && -f "$sudoers_src" ]] || { ui_log_fail "Helper or sudoers template missing under $plugin_root."; return 1; }
+    # S2: never trust the user-writable copies. The helper must match the pinned hash
+    # and the template must equal the rule generated in code, before any sudo.
+    local src_sha
+    src_sha=$(sha256sum "$helper_src" 2>/dev/null | awk '{print $1}')
+    if [[ "$src_sha" != "$DEEP_HELPER_SHA256" ]]; then
+        ui_log_fail "Refusing: $helper_src does not match the pinned helper hash (modified copy?)." \
+            "Reinstall oma-server from a clean checkout."
+        return 1
+    fi
+    if ! cmp -s "$sudoers_src" <(deep_sudoers_expected); then
+        ui_log_fail "Refusing: $sudoers_src differs from the rule oma-server generates (modified copy?)." \
+            "Reinstall oma-server from a clean checkout."
+        return 1
+    fi
     command -v sudo >/dev/null 2>&1 || { ui_log_fail "sudo is not installed."; return 1; }
     _deep_sudo_version_ok || { ui_log_fail "sudo >= 1.9.10 is required (anchored-regex sudoers arguments)."; return 1; }
     if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx wheel; then
@@ -753,8 +881,8 @@ deep_setup() {
         ui_log_fail "Refusing: $DEEP_HELPER_DIR exists but is not a real directory."
         return 1
     fi
-    if [[ -L "$DEEP_HELPER_PATH" || -L "$DEEP_SUDOERS_PATH" ]]; then
-        ui_log_fail "Refusing: an existing helper or sudoers path is a symlink."
+    if [[ -L "$DEEP_HELPER_PATH" ]]; then
+        ui_log_fail "Refusing: the existing helper path is a symlink."
         return 1
     fi
     if [[ -f "$config_file" ]] && [[ ! -w "$config_file" ]]; then
@@ -767,7 +895,7 @@ deep_setup() {
     printf "         %s  (root:root 0755, fixed verbs only)\n" "$DEEP_HELPER_PATH"
     printf "         %s  (root:root 0440, validated with visudo)\n" "$DEEP_SUDOERS_PATH"
     printf "\n         sudoers rule:\n"
-    grep -v '^[[:space:]]*#' "$sudoers_src" | sed 's/^/           /'
+    deep_sudoers_expected | grep -v '^[[:space:]]*#' | sed 's/^/           /'
     echo ""
     ui_log_warn "Any process running as a wheel user can then stop/start the desktop without a password (local DoS, no privilege escalation)."
     printf "%s Install the Deep Server Mode helper and sudoers rule? [y/N]: " "$(ui_badge_info)"
@@ -782,14 +910,38 @@ deep_setup() {
     local tmp_sudoers="${sudoers_dir}/.oma-server-deep.tmp"
     local tmp_helper="${DEEP_HELPER_DIR}/.deep-helper.tmp"
 
-    # 1. Stage and validate the sudoers file first: if it does not parse, nothing is installed.
+    # /etc/sudoers.d is root-only, so the symlink check needs sudo.
+    if sudo test -L "$DEEP_SUDOERS_PATH"; then
+        ui_log_fail "Refusing: $DEEP_SUDOERS_PATH is a symlink."
+        return 1
+    fi
+
+    # Private snapshots of what will be installed (generated rule, hashed helper).
+    local work; work=$(mktemp -d)
+    chmod 0700 "$work"
+    deep_sudoers_expected > "$work/sudoers"
+    cp "$helper_src" "$work/helper"
+    if [[ "$(sha256sum "$work/helper" | awk '{print $1}')" != "$DEEP_HELPER_SHA256" ]]; then
+        rm -rf "$work"; ui_log_fail "Helper changed while staging; aborted."; return 1
+    fi
+
+    # 1. Stage and validate the sudoers file first: if it does not parse or does not
+    #    match the generated rule byte-for-byte, nothing is installed.
     #    (sudo ignores files in sudoers.d whose names contain a dot.)
-    if ! sudo install -m 0440 "$sudoers_src" "$tmp_sudoers" || ! sudo chown root:root "$tmp_sudoers"; then
+    if ! sudo install -m 0440 "$work/sudoers" "$tmp_sudoers" || ! sudo chown root:root "$tmp_sudoers"; then
         sudo rm -f "$tmp_sudoers" || true
+        rm -rf "$work"
         ui_log_fail "Could not stage $tmp_sudoers."
         return 1
     fi
+    if ! sudo cat "$tmp_sudoers" | cmp -s - <(deep_sudoers_expected); then
+        sudo rm -f "$tmp_sudoers" || true
+        rm -rf "$work"
+        ui_log_fail "Staged sudoers file does not match the generated rule; nothing was installed."
+        return 1
+    fi
     if ! sudo visudo -cf "$tmp_sudoers" >/dev/null; then
+        rm -rf "$work"
         sudo rm -f "$tmp_sudoers" || true
         ui_log_fail "sudoers validation (visudo -cf) failed; nothing was installed."
         return 1
@@ -797,15 +949,25 @@ deep_setup() {
 
     # 2. Install the helper into a root-owned directory, atomically.
     if ! sudo mkdir -p "$DEEP_HELPER_DIR" || ! sudo chown root:root "$DEEP_HELPER_DIR" || ! sudo chmod 0755 "$DEEP_HELPER_DIR" || \
-       ! sudo install -m 0755 "$helper_src" "$tmp_helper" || ! sudo chown root:root "$tmp_helper" || \
-       ! sudo mv -f "$tmp_helper" "$DEEP_HELPER_PATH"; then
+       ! sudo install -m 0755 "$work/helper" "$tmp_helper" || ! sudo chown root:root "$tmp_helper"; then
         sudo rm -f "$tmp_sudoers" "$tmp_helper" || true
+        rm -rf "$work"
         ui_log_fail "Could not install the helper; nothing was activated."
         return 1
     fi
-    if ! cmp -s "$helper_src" "$DEEP_HELPER_PATH"; then
-        sudo rm -f "$tmp_sudoers" "$DEEP_HELPER_PATH" || true
-        ui_log_fail "Installed helper does not match the source; removed it."
+    rm -rf "$work"
+    # Verify the root-owned staged copy (not the user-writable source) before the rename.
+    if [[ "$(sudo sha256sum "$tmp_helper" | awk '{print $1}')" != "$DEEP_HELPER_SHA256" ]] || \
+       ! sudo mv -f "$tmp_helper" "$DEEP_HELPER_PATH"; then
+        sudo rm -f "$tmp_sudoers" "$tmp_helper" || true
+        ui_log_fail "Staged helper does not match the pinned hash; nothing was activated."
+        return 1
+    fi
+    # S3: refuse to activate the grant over a helper or directory others can write.
+    if ! _deep_path_safe "$DEEP_HELPER_PATH" || ! _deep_path_safe "$DEEP_HELPER_DIR" || \
+       ! _deep_path_safe "${DEEP_HELPER_DIR%/*}"; then
+        sudo rm -f "$tmp_sudoers" || true
+        ui_log_fail "Helper or one of its directories is group/world-writable or not root-owned; grant NOT activated."
         return 1
     fi
 
@@ -840,16 +1002,16 @@ deep_setup_remove() {
         ui_log_fail "Deep Server Mode is active ($(deep_state_get state UNKNOWN))." "Run 'oma-server disable' first."
         return 1
     fi
-    if [[ -f "$config_file" ]]; then
-        deep_config_set_allowed "$config_file" false || true
-    fi
-    if [[ ! -e "$DEEP_SUDOERS_PATH" && ! -e "$DEEP_HELPER_PATH" && ! -d "$DEEP_HELPER_DIR" ]]; then
-        ui_log_info "Deep Server Mode helper and sudoers rule are not installed."
-        return 0
-    fi
+    # /etc/sudoers.d is not readable by the user, so "installed" is judged by the
+    # visible helper/dir or the grant probe; with a TTY we always remove both paths.
     if [[ ! -t 0 ]]; then
-        ui_log_fail "Removing root files needs an interactive terminal (sudo password)." "Run it with 'ssh -t' or from a terminal."
-        return 1
+        if deep_footprint_visible; then
+            ui_log_fail "Removing root files needs an interactive terminal (sudo password)." "Run it with 'ssh -t' or from a terminal."
+            return 1
+        fi
+        [[ -f "$config_file" ]] && { deep_config_set_allowed "$config_file" false || true; }
+        ui_log_info "No Deep Server Mode helper or grant is visible. Run with a TTY to also clear $DEEP_SUDOERS_PATH as root."
+        return 0
     fi
     # Revoke the grant first, then remove the helper.
     sudo rm -f "$DEEP_SUDOERS_PATH" "${DEEP_SUDOERS_PATH%/*}/.oma-server-deep.tmp" || { ui_log_fail "Could not remove $DEEP_SUDOERS_PATH."; return 1; }
@@ -857,6 +1019,7 @@ deep_setup_remove() {
     if [[ -d "$DEEP_HELPER_DIR" && ! -L "$DEEP_HELPER_DIR" ]]; then
         sudo rmdir "$DEEP_HELPER_DIR" 2>/dev/null || true
     fi
+    [[ -f "$config_file" ]] && { deep_config_set_allowed "$config_file" false || true; }
     ui_log_ok "Removed the Deep Server Mode helper and sudoers rule."
     return 0
 }

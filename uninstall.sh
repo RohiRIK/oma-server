@@ -50,13 +50,36 @@ fi
 #    remove the opt-in root helper + sudoers rule before the CLI that removes them.
 DEEP_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server/deep.json"
 DEEP_ROOT_PREFIX="${OMA_SERVER_TEST_ROOT:-}"
+# OMA_SERVER_TEST_ROOT is test-only (same guard as lib/deep.sh).
+if [[ -n "$DEEP_ROOT_PREFIX" ]]; then
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] || { echo "OMA_SERVER_TEST_ROOT is test-only (set OMA_SERVER_TEST_MODE=1)" >&2; exit 2; }
+    [[ "$(id -u)" -ne 0 ]] || { echo "OMA_SERVER_TEST_ROOT refused as root" >&2; exit 2; }
+    [[ "$DEEP_ROOT_PREFIX" == /* && -d "$DEEP_ROOT_PREFIX" \
+       && "$(realpath -e -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$DEEP_ROOT_PREFIX" \
+       && "$(stat -c %u -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$(id -u)" ]] || {
+        echo "OMA_SERVER_TEST_ROOT must be a real, user-owned absolute dir" >&2; exit 2; }
+    for b in sudo pkexec; do
+        case "$(command -v "$b" 2>/dev/null)" in
+            /usr/bin/*|/bin/*|/usr/local/bin/*|/usr/sbin/*|/sbin/*) echo "OMA_SERVER_TEST_ROOT refused: real $b on PATH" >&2; exit 2 ;;
+        esac
+    done
+fi
 DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}/usr/local/lib/oma-server/deep-helper"
-DEEP_SUDOERS_PATH="${DEEP_ROOT_PREFIX}/etc/sudoers.d/oma-server-deep"
+DEEP_HELPER_DIR="${DEEP_HELPER_PATH%/*}"
+# /etc/sudoers.d is root-only (0750), so the rule itself cannot be seen. Detect the
+# install by the helper/dir or by the grant showing up in 'sudo -n -l -l'.
+deep_installed="false"
+if [[ -e "$DEEP_HELPER_PATH" || -d "$DEEP_HELPER_DIR" ]]; then
+    deep_installed="true"
+elif command -v sudo >/dev/null 2>&1 && \
+     sudo -n -l -l "$DEEP_HELPER_PATH" check 2>/dev/null | grep -q '!authenticate'; then
+    deep_installed="true"
+fi
 if [[ -f "$DEEP_STATE_FILE" ]]; then
     printf "[ FAIL ] Deep Server Mode is active (%s). Run 'oma-server disable' first; nothing was removed.\n" "$DEEP_STATE_FILE" >&2
     exit 1
 fi
-if [[ -e "$DEEP_HELPER_PATH" || -e "$DEEP_SUDOERS_PATH" ]]; then
+if [[ "$deep_installed" == "true" ]]; then
     deep_cli=""
     for cand in "$TARGET_DIR/bin/oma-server" "$SCRIPT_DIR/bin/oma-server"; do
         [[ -x "$cand" ]] && { deep_cli="$cand"; break; }

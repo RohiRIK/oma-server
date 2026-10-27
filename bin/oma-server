@@ -68,18 +68,25 @@ deep_status() {
             timeout_status="Expired (${tlabel})"
         fi
     fi
-    [[ "$state" == "DEEP_DEGRADED" ]] && health="DEGRADED"
+    local hint=""
+    if [[ "$state" == "DEEP_DEGRADED" ]]; then
+        health="DEGRADED"
+    elif [[ "$state" == "DEEP_EXITING" || "$state" == "DEEP_ENTERING" ]] && ! deep_lock_held; then
+        # A transition state with nobody holding deep.lock: its worker died.
+        health="DEGRADED"
+        hint="stale ${state} (no transition running); run 'oma-server disable' to finish"
+    fi
     local since; since=$(date -d "@$entered" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "epoch:$entered")
     if [[ "$as_json" == "true" ]]; then
         jq -n --arg mode "$state" --arg since "$since" --argjson el "$elapsed" \
             --arg eh "$(ui_format_duration_human "$elapsed")" --arg ts "$timeout_status" --arg health "$health" \
-            --arg rt "$DEEP_STATE_FILE" '{
+            --arg rt "$DEEP_STATE_FILE" --arg hint "$hint" '{
                 mode: $mode, is_homelab: false, is_deep: true, since: $since,
                 elapsed_seconds: $el, elapsed_human: $eh,
                 inhibitor: "Active (root, oma-server-deep-inhibit)", timeout: null,
                 timeout_status: $ts, timeout_remaining: "", dpms: "N/A (no session)",
                 quickshell: "Stopped (Deep Server)", protected_active: 0, protected_total: 0,
-                health: $health, runtime_state: $rt
+                health: $health, runtime_state: $rt, health_hint: $hint
             }'
         return 0
     fi
@@ -88,7 +95,9 @@ deep_status() {
     ui_log_info "Since       : ${since} ($(ui_format_duration_human "$elapsed"))"
     ui_log_info "Auto-revert : ${timeout_status}"
     ui_log_info "State file  : ${DEEP_STATE_FILE}"
-    if [[ "$health" == "DEGRADED" ]]; then
+    if [[ -n "$hint" ]]; then
+        ui_log_warn "Health      : DEGRADED, ${hint}." "Or '${DEEP_PANIC_HINT}'."
+    elif [[ "$health" == "DEGRADED" ]]; then
         ui_log_warn "The last exit did not bring the desktop back." "Run '$CMD_NAME disable' again, or '${DEEP_PANIC_HINT}'."
     else
         ui_log_info "Way back    : '$CMD_NAME disable' (SSH or Ctrl+Alt+F2), reboot, or '${DEEP_PANIC_HINT}'"
@@ -502,11 +511,14 @@ case "$cmd" in
             ui_log_fail "Atomic snapshot write/validation failed at '$SNAPSHOT_FILE'." \
                 "Verify free space in '$RUN_DIR' (tmpfs)."
             rm -f "$LOCK_FILE"
+            rmdir "$RUN_DIR" 2>/dev/null || true
             exit 1
         fi
 
         if ! apply_homelab_mode "$RUN_DIR" "$CONFIG_FILE" "$SNAPSHOT_FILE" "$timeout_seconds" "$timeout_arg" "$REAL_SCRIPT"; then
             rm -f "$LOCK_FILE"
+            # Failed-enable rollback leaves an empty runtime dir behind; drop it.
+            rmdir "$RUN_DIR" 2>/dev/null || true
             exit 1
         fi
 
@@ -539,9 +551,10 @@ case "$cmd" in
 
         if deep_state_exists; then
             deep_rc=0
+            deep_from="$(deep_state_get state DEEP_SERVER)"
             deep_exit_transaction "$CONFIG_FILE" "$is_auto_timeout" || deep_rc=$?
             if (( deep_rc == 0 )); then
-                ui_log_ok "Desktop restored: DEEP_SERVER -> HOST_LAPTOP."
+                ui_log_ok "Desktop restored: ${deep_from} -> HOST_LAPTOP."
             fi
             exit "$deep_rc"
         fi

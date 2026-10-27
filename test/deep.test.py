@@ -135,7 +135,12 @@ scope=sys; [[ "$1" == "--user" ]] && {{ scope=user; shift; }}
 cmd="$1"; shift || true
 args=(); for a in "$@"; do [[ "$a" == --* ]] || args+=("$a"); done
 case "$cmd" in
-  is-active) [[ -e "$S/$scope-active/${{args[0]}}" ]] && exit 0 || exit 3 ;;
+  is-active)
+    q=0; for a in "$@"; do [[ "$a" == "--quiet" ]] && q=1; done
+    if [[ -e "$S/$scope-active/${{args[0]}}" ]]; then (( q )) || echo active; exit 0; fi
+    if [[ -e "$S/$scope-activating/${{args[0]}}" ]]; then (( q )) || echo activating; exit 3; fi
+    (( q )) || echo inactive; exit 3 ;;
+  list-jobs) [[ -e "$S/user-jobs" ]] && cat "$S/user-jobs"; exit 0 ;;
   is-failed) [[ -e "$S/$scope-failed/${{args[0]}}" ]] && exit 0 || exit 1 ;;
   stop) for u in "${{args[@]}}"; do rm -f "$S/$scope-active/$u"; done; exit 0 ;;
   start) for u in "${{args[@]}}"; do touch "$S/$scope-active/$u"; done; exit 0 ;;
@@ -146,6 +151,11 @@ esac
 S="{S}"; echo "uwsm $*" >> "{L}"
 if [[ "$1" == "stop" ]]; then
   [[ "${{OMA_TEST_UWSM_FAIL:-0}}" == "1" ]] && exit 1
+  if [[ "${{OMA_TEST_UWSM_FAIL_ONCE:-0}}" == "1" && ! -e "$S/uwsm-failed-once" ]]; then
+    touch "$S/uwsm-failed-once"
+    echo "Failed to stop wayland-wm@hyprland.desktop.service: Transaction for wayland-wm@hyprland.desktop.service/stop is destructive (org.freedesktop.systemd1.TransactionIsDestructive)" >&2
+    exit 1
+  fi
   rm -f "$S/user-active/wayland-wm@hyprland.desktop.service" "$S/user-active/graphical-session.target"
   echo "[]" > "$S/clients.json"
 fi
@@ -168,6 +178,7 @@ if [[ "$1" == "$HELPER" ]]; then
   case "$verb" in
     dm-stop) [[ "${{OMA_TEST_DMSTOP_FAIL:-0}}" == "1" ]] && exit 1; rm -f "$S/sys-active/display-manager.service" ;;
     dm-start|dm-restart)
+      [[ "${{OMA_TEST_DMSTART_FAIL:-0}}" == "1" ]] && exit 1
       touch "$S/sys-active/display-manager.service"
       if [[ -e "$S/autologin_works" ]]; then
         touch "$S/user-active/wayland-wm@hyprland.desktop.service" "$S/user-active/graphical-session.target"
@@ -183,6 +194,11 @@ if [[ "$1" == "$HELPER" ]]; then
 fi
 case "$1" in
   chown) exit 0 ;;   # cannot chown to root in the sandbox
+  install)
+    if [[ "${{OMA_TEST_STAGE_TAMPER:-0}}" == "1" && "${{@: -1}}" == *.oma-server-deep.tmp ]]; then
+      "$@"; rc=$?; chmod u+w "${{@: -1}}"; echo "ALL ALL=(ALL) NOPASSWD: ALL" >> "${{@: -1}}"; exit $rc
+    fi
+    exec "$@" ;;
   visudo)
     shift
     if [[ "${{OMA_TEST_VISUDO_FAIL:-0}}" == "1" ]]; then echo "parse error" >&2; exit 1; fi
@@ -229,17 +245,21 @@ exit 0
         write_executable(self.bin / "hyprctl", f"""#!/usr/bin/env bash
 S="{S}"
 [[ "${{OMA_TEST_HYPR_FAIL:-0}}" == "1" ]] && exit 1
+[[ -e "$S/hypr-broken" ]] && exit 1
+if [[ -e "$S/hypr-fail-once" ]]; then rm -f "$S/hypr-fail-once"; echo "HYPRLAND_INSTANCE_SIGNATURE invalid" ; exit 1; fi
 if [[ "$1" == "clients" ]]; then cat "$S/clients.json"; exit 0; fi
 if [[ "$1" == "-j" && "$2" == "monitors" ]]; then echo '[{{"name":"eDP-1","dpmsStatus":true}}]'; exit 0; fi
 echo ok
 """)
         write_executable(self.bin / "omarchy-hyprland-window-close-all", f"""#!/usr/bin/env bash
 echo "window-close-all" >> "{L}"
+[[ "${{OMA_TEST_CLOSE_BREAKS_IPC:-0}}" == "1" ]] && touch "{S}/hypr-broken"
 [[ "${{OMA_TEST_WINDOWS_STUCK:-0}}" == "1" ]] || echo "[]" > "{S}/clients.json"
 exit 0
 """)
         write_executable(self.bin / "id", """#!/usr/bin/env bash
 if [[ "$1" == "-nG" ]]; then echo "user wheel"; exit 0; fi
+if [[ "$1" == "-u" && "${OMA_TEST_FAKE_ROOT:-0}" == "1" ]]; then echo 0; exit 0; fi
 exec /usr/bin/id "$@"
 """)
         for name in ("pgrep",):
@@ -260,6 +280,7 @@ exec /usr/bin/pgrep "$@"
             "OMA_SERVER_RUNTIME_BASE": str(self.run_base),
             "OMA_SERVER_RUN_DIR": str(self.run_dir),
             "OMA_SERVER_TEST_ROOT": str(self.root),
+            "OMA_SERVER_TEST_MODE": "1",
             "OMA_DEEP_POLL_INTERVAL": "0.05",
             "OMA_DEEP_FOLLOW_SECONDS": "5",
             "TERM": "dumb",
@@ -821,6 +842,303 @@ class InstallUninstallDeepTests(DeepSandbox):
         self.assertFalse(self.helper_path.exists())
         self.assertFalse(self.sudoers_path.exists())
         self.assertFalse((self.cfg_dir / "bin").exists())
+
+
+class FollowUpFixTests(DeepSandbox):
+    """PR #3 review fixes: Quill Q1-Q5, Sam S1-S3."""
+
+    def helper_calls(self):
+        return [c.split("deep-helper ", 1)[1] for c in self.calls()
+                if "deep-helper " in c and c.startswith("sudo") and "-l -l" not in c]
+
+    def deep_log(self):
+        p = self.deep_dir / "deep.log"
+        return p.read_text() if p.exists() else ""
+
+    # ---- Q1: /etc/sudoers.d is root 0750, the user cannot see the rule ----
+    def test_q1_enter_works_when_sudoers_dir_unreadable(self):
+        self.install_helper()
+        sd = self.sudoers_path.parent
+        sd.chmod(0o000)
+        try:
+            res = self.cli("enable", "--deep")
+        finally:
+            sd.chmod(0o755)
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.deep_state()["state"], "DEEP_SERVER")
+
+    def test_q1_without_grant_still_refuses(self):
+        self.install_helper(grant=False)
+        res = self.cli("enable", "--deep")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIsNone(self.deep_state())
+
+    def test_q1_setup_checks_sudoers_symlink_as_root(self):
+        self.sudoers_path.symlink_to("/etc/passwd")
+        res = self.cli_tty("deep-setup", answers="y\n")
+        self.assertNotEqual(res.rc, 0, res.plain)
+        self.assertIn("symlink", res.plain)
+        self.assertIn(f"sudo test -L {self.sudoers_path}", self.calls())
+        self.assertFalse(self.helper_path.exists())
+
+    def test_q1_remove_with_tty_clears_rule_even_when_helper_missing(self):
+        self.install_helper(grant=False)
+        self.helper_path.unlink()
+        self.helper_path.parent.rmdir()
+        res = self.cli_tty("deep-setup", "--remove")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertFalse(self.sudoers_path.exists(), "orphan sudoers rule must still be removed as root")
+
+    def test_q1_uninstall_detects_install_by_helper_dir(self):
+        subprocess.run(["bash", str(ROOT / "install.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                       env=self.env(), timeout=60)
+        self.helper_path.parent.mkdir(parents=True)
+        res = subprocess.run(["bash", str(ROOT / "uninstall.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, env=self.env(), timeout=60)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("deep-setup --remove", res.stderr)
+
+    # ---- Q2: never kill the fresh Hyprland ----
+    def test_q2_exit_with_session_back_never_stops_session_units(self):
+        self.install_helper()
+        self.write_deep_state()
+        (self.s / "inhibit").touch()
+        # root revert timer already started SDDM and Hyprland is up
+        res = self.cli("disable")
+        self.assertEqual(res.returncode, 0, res.plain)
+        calls = self.calls()
+        self.assertFalse(any("stop graphical-session.target" in c for c in calls), calls)
+        self.assertFalse(any("reset-failed" in c and "wayland-wm" in c for c in calls), calls)
+        self.assertNotIn("dm-start", self.helper_calls())
+        self.assertNotIn("dm-restart", self.helper_calls())
+        self.assertTrue(self.is_active("user", "wayland-wm@hyprland.desktop.service"))
+        self.assertIsNone(self.deep_state())
+
+    def test_q2_exit_with_session_activating_never_stops_it(self):
+        self.install_helper()
+        self.write_deep_state()
+        self.set_active("user", "wayland-wm@hyprland.desktop.service", False)
+        act = self.s / "user-activating"
+        act.mkdir()
+        (act / "wayland-wm@hyprland.desktop.service").touch()
+        self.cli("disable")
+        calls = self.calls()
+        self.assertFalse(any("stop graphical-session.target" in c for c in calls), calls)
+        self.assertNotIn("dm-start", self.helper_calls())
+
+    def test_q2_post_boot_hook_detaches_via_systemd_run(self):
+        self.write_deep_state(state="DEEP_SERVER")
+        write_executable(self.bin / "oma-server", f"""#!/usr/bin/env bash
+echo "oma-server $*" >> "{self.log}"
+""")
+        subprocess.run(["bash", str(ROOT / "hooks/post-boot.d/99-server-profile-check.sh")],
+                       capture_output=True, text=True, env=self.env(), timeout=20)
+        calls = self.calls()
+        i_run = next(i for i, c in enumerate(calls) if c.startswith("systemd-run --user")
+                     and "--unit=oma-server-deep-postboot" in c and c.endswith("__deep-post-boot"))
+        self.assertIn("oma-server __deep-post-boot", calls[i_run + 1:])
+
+    def test_q2_status_flags_stale_exiting(self):
+        self.install_helper()
+        self.write_deep_state(state="DEEP_EXITING")
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertEqual(st["health"], "DEGRADED")
+        self.assertIn("stale DEEP_EXITING", st["health_hint"])
+        plain = self.cli("status").plain
+        self.assertIn("stale DEEP_EXITING", plain)
+
+    def test_q2_status_not_stale_while_lock_held(self):
+        self.install_helper()
+        self.write_deep_state(state="DEEP_EXITING")
+        lock = self.deep_dir / "deep.lock"
+        holder = subprocess.Popen(["flock", str(lock), "sleep", "5"])
+        try:
+            import time
+            time.sleep(0.3)
+            st = json.loads(self.cli("status", "--json").stdout)
+        finally:
+            holder.kill()
+        self.assertEqual(st["health"], "OK")
+
+    # ---- Q3: hyprctl IPC error vs empty list ----
+    def test_q3_ipc_error_after_close_is_reported_as_such(self):
+        self.install_helper()
+        self.set_clients([{"class": "foot", "title": "t", "pid": 9}])
+        res = self.cli_tty("enable", "--deep", "--close-apps", answers="yes\n\n",
+                           extra_env={"OMA_TEST_CLOSE_BREAKS_IPC": "1"})
+        self.assertEqual(res.rc, 1, res.plain)
+        self.assertIn("IPC error", self.last_deep()["reason"])
+        self.assertNotIn("uwsm stop", self.calls())
+
+    def test_q3_transient_ipc_error_is_retried(self):
+        self.install_helper()
+        (self.s / "hypr-fail-once").touch()
+        res = self.cli("enable", "--deep")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.deep_state()["state"], "DEEP_SERVER")
+
+    # ---- Q4: uwsm TransactionIsDestructive ----
+    def test_q4_uwsm_destructive_transaction_retried_once(self):
+        self.install_helper()
+        res = self.cli("enable", "--deep", extra_env={"OMA_TEST_UWSM_FAIL_ONCE": "1"})
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.calls().count("uwsm stop"), 2)
+        self.assertIn("TransactionIsDestructive", self.deep_log())
+        self.assertEqual(self.deep_state()["state"], "DEEP_SERVER")
+
+    def test_q4_uwsm_persistent_failure_still_rolls_back(self):
+        self.install_helper()
+        res = self.cli("enable", "--deep", extra_env={"OMA_TEST_UWSM_FAIL": "1"})
+        self.assertEqual(res.returncode, 1, res.plain)
+        self.assertEqual(self.calls().count("uwsm stop"), 2)
+        self.assertIsNone(self.deep_state())
+
+    # ---- Q5 cosmetics ----
+    def test_q5_instant_dm_start_failure_reason(self):
+        self.install_helper()
+        self.write_deep_state()
+        self.enter_desktop_down()
+        res = self.cli("disable", extra_env={"OMA_TEST_DMSTART_FAIL": "1"})
+        self.assertEqual(res.returncode, 1, res.plain)
+        log = self.deep_log()
+        self.assertIn("DEEP_DEGRADED (dm-start failed)", log)
+        self.assertNotIn("within", log.split("DEEP_DEGRADED", 1)[1].splitlines()[0])
+
+    def test_q5_transition_line_uses_real_prior_state(self):
+        self.install_helper()
+        self.write_deep_state(state="DEEP_DEGRADED")
+        self.enter_desktop_down()
+        res = self.cli("disable")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("DEEP_DEGRADED -> HOST_LAPTOP", res.plain)
+        self.assertNotIn("DEEP_SERVER -> HOST_LAPTOP", res.plain)
+
+    def test_q5_remove_without_tty_keeps_allowed_when_refusing(self):
+        self.install_helper()
+        res = self.cli("deep-setup", "--remove")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("allowed = true", self.cfg.read_text())
+        self.assertTrue(self.helper_path.exists())
+
+    def test_q5_remove_without_tty_when_nothing_visible(self):
+        res = self.cli("deep-setup", "--remove")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("allowed = false", self.cfg.read_text())
+
+    # ---- S1: OMA_SERVER_TEST_ROOT is test-only ----
+    def assert_guard(self, res, needle):
+        self.assertEqual(res.returncode, 2, res.plain)
+        self.assertIn(needle, res.plain)
+        self.assertFalse(any(c.startswith(("sudo", "pkexec")) for c in self.calls()))
+
+    def test_s1_prefix_without_test_mode_refused(self):
+        self.install_helper()
+        self.assert_guard(self.cli("status", extra_env={"OMA_SERVER_TEST_MODE": ""}), "test-only")
+        self.assert_guard(self.cli("enable", "--deep", extra_env={"OMA_SERVER_TEST_MODE": ""}), "test-only")
+
+    def test_s1_prefix_refused_as_root(self):
+        self.assert_guard(self.cli("status", extra_env={"OMA_TEST_FAKE_ROOT": "1"}), "refused as root")
+
+    def test_s1_symlinked_prefix_refused(self):
+        link = self.base / "rootlink"
+        link.symlink_to(self.root)
+        self.assert_guard(self.cli("status", extra_env={"OMA_SERVER_TEST_ROOT": str(link)}), "real, user-owned")
+        self.assert_guard(self.cli("status", extra_env={"OMA_SERVER_TEST_ROOT": "relative/dir"}), "real, user-owned")
+
+    def test_s1_real_sudo_on_path_refused(self):
+        real = shutil.which("sudo", path="/usr/bin:/bin:/usr/local/bin")
+        if not real:
+            self.skipTest("no real sudo on this host")
+        res = self.cli("status", extra_env={"PATH": f"/usr/bin:/bin:{self.bin}"})
+        self.assertEqual(res.returncode, 2, res.plain)
+        self.assertIn("real sudo on PATH", res.plain)
+
+    def test_s1_uninstall_guarded_too(self):
+        env = self.env({"OMA_SERVER_TEST_MODE": ""})
+        res = subprocess.run(["bash", str(ROOT / "uninstall.sh")], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, env=env, timeout=60)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("test-only", res.stderr)
+
+    def test_s1_worker_env_forwarding_gated_on_test_mode(self):
+        src = (ROOT / "lib/deep.sh").read_text()
+        self.assertIn('[[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)', src)
+        base = src.split("local -a fwd=(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("OMA_SERVER_TEST_ROOT", base)
+
+    # ---- S2: generated sudoers rule + pinned helper ----
+    def plugin_copy(self):
+        dst = self.base / "plugin"
+        for sub in ("bin", "lib", "libexec", "templates", "config"):
+            shutil.copytree(ROOT / sub, dst / sub, symlinks=True)
+        return dst
+
+    def test_s2_template_equals_generated_rule(self):
+        out = subprocess.run(["bash", "-c", 'source lib/ui.sh; source lib/config.sh; source lib/deep.sh; deep_sudoers_expected'],
+                             cwd=ROOT, capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)}, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, SUDOERS.read_text())
+
+    def test_s2_helper_hash_is_pinned(self):
+        import hashlib
+        pinned = re.search(r'DEEP_HELPER_SHA256="([0-9a-f]{64})"', (ROOT / "lib/deep.sh").read_text()).group(1)
+        self.assertEqual(pinned, hashlib.sha256(HELPER.read_bytes()).hexdigest(),
+                         "update DEEP_HELPER_SHA256 in lib/deep.sh after changing the helper")
+
+    def test_s2_one_byte_template_change_refused_before_sudo(self):
+        plug = self.plugin_copy()
+        tpl = plug / "templates/sudoers-oma-server-deep"
+        tpl.write_text(tpl.read_text().replace("dm-stop,", "dm-stop ,", 1))
+        res = subprocess.run(["script", "-qec", f"{plug / 'bin/oma-server'} deep-setup; echo __RC=$?", "/dev/null"],
+                             input="y\n", capture_output=True, text=True, env=self.env(), timeout=60)
+        out = ANSI_RE.sub("", res.stdout + res.stderr)
+        self.assertIn("__RC=1", out, out)
+        self.assertIn("differs from the rule", out)
+        self.assertFalse(any(c.startswith("sudo") for c in self.calls()), self.calls())
+        self.assertFalse(self.helper_path.exists())
+
+    def test_s2_modified_helper_refused_before_sudo(self):
+        plug = self.plugin_copy()
+        h = plug / "libexec/oma-server-deep-helper"
+        h.write_text(h.read_text() + "\n# x\n")
+        res = subprocess.run(["script", "-qec", f"{plug / 'bin/oma-server'} deep-setup; echo __RC=$?", "/dev/null"],
+                             input="y\n", capture_output=True, text=True, env=self.env(), timeout=60)
+        out = ANSI_RE.sub("", res.stdout + res.stderr)
+        self.assertIn("__RC=1", out, out)
+        self.assertIn("pinned helper hash", out)
+        self.assertFalse(any(c.startswith("sudo") for c in self.calls()))
+
+    def test_s2_staged_file_compared_before_activation(self):
+        res = self.cli_tty("deep-setup", answers="y\n", extra_env={"OMA_TEST_STAGE_TAMPER": "1"})
+        self.assertNotEqual(res.rc, 0, res.plain)
+        self.assertIn("does not match the generated rule", res.plain)
+        self.assertFalse(self.sudoers_path.exists())
+        self.assertFalse(any(c.startswith("sudo mv") for c in self.calls()))
+        self.assertEqual(list(self.sudoers_path.parent.iterdir()), [])
+
+    def test_s2_installed_sudoers_is_generated_text(self):
+        res = self.cli_tty("deep-setup", answers="y\n")
+        self.assertEqual(res.rc, 0, res.plain)
+        self.assertEqual(self.sudoers_path.read_text(), SUDOERS.read_text())
+
+    # ---- S3: no group/world-writable helper or folder ----
+    def test_s3_group_writable_helper_dir_refused(self):
+        self.install_helper()
+        self.helper_path.parent.chmod(0o775)
+        res = self.cli("enable", "--deep")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIsNone(self.deep_state())
+        self.assertNotIn("dm-stop", self.helper_calls())
+
+    def test_s3_world_writable_helper_or_parent_refused(self):
+        self.install_helper()
+        self.helper_path.chmod(0o757)
+        self.assertNotEqual(self.cli("enable", "--deep").returncode, 0)
+        self.helper_path.chmod(0o755)
+        (self.root / "usr/local/lib").chmod(0o777)
+        self.assertNotEqual(self.cli("enable", "--deep").returncode, 0)
+        (self.root / "usr/local/lib").chmod(0o755)
+        self.assertEqual(self.cli("enable", "--deep").returncode, 0)
 
 
 if __name__ == "__main__":

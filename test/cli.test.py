@@ -272,6 +272,7 @@ exec /usr/bin/pkill "$@"
             (self.run_dir / "active-snapshot.json").exists(),
             "Rollback must remove active-snapshot.json when inhibitor fails",
         )
+        self.assertFalse(self.run_dir.exists(), "Failed-enable rollback must remove the empty runtime dir")
         # systemd-inhibit's own error must survive into the failure message
         self.assertIn("Interactive authentication required", ANSI_RE.sub("", res.stderr))
 
