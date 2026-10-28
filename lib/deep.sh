@@ -377,7 +377,12 @@ _deep_proc_under_shell() {
 deep_list_session_bound_procs() {
     local gui_pids="${1:-}"
     local uid="${UID:-$(id -u)}"
-    local mgr="${OMA_SERVER_TEST_CGROUP_ROOT:-/sys/fs/cgroup}/user.slice/user-${uid}.slice/user@${uid}.service"
+    local cg_root="/sys/fs/cgroup"
+    # INFO-12: the fake cgroup tree is honoured only with the guarded test root.
+    if [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && -n "${OMA_SERVER_TEST_CGROUP_ROOT:-}" ]]; then
+        cg_root="$OMA_SERVER_TEST_CGROUP_ROOT"
+    fi
+    local mgr="${cg_root}/user.slice/user-${uid}.slice/user@${uid}.service"
     [[ -d "$mgr" ]] || return 0
     local self_chain=" " p="$$" n=0
     while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 && n < 64 )); do
@@ -880,9 +885,35 @@ deep_exit_transaction() {
     deep_state_read >/dev/null || { ui_log_info "No Deep Server state."; return 0; }
 
     exec 201>"$DEEP_LOCK_FILE"
-    if ! flock -w 10 201; then
-        ui_log_fail "Another deep-mode transition holds $DEEP_LOCK_FILE." "Wait and retry 'oma-server disable'."
-        return 1
+    local lock_wait=10
+    # Test mode with the guarded test root only: shorten the first lock wait.
+    if [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && "${OMA_DEEP_LOCK_WAIT:-}" =~ ^[0-9]+$ ]]; then
+        lock_wait="$OMA_DEEP_LOCK_WAIT"
+    fi
+    if ! flock -w "$lock_wait" 201; then
+        # Quill Low: a second `disable` (e.g. SSH right after tty1) must not report FAIL
+        # while the first restore is fine. If the holder is an exit, wait for it and
+        # report the real outcome below; only another kind of transition is an error.
+        local holder; holder=$(deep_state_get state "")
+        if [[ -z "$holder" || "$holder" == DEEP_EXITING ]] || deep_exit_unit_running; then
+            local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}" ew
+            if ! [[ "$follow_max" =~ ^[0-9]+$ ]]; then
+                ew=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
+                [[ "$ew" =~ ^[0-9]+$ ]] && (( ew >= 1 && ew <= 600 )) || ew=45
+                follow_max=$(( 2 * ew + 60 ))
+            fi
+            ui_log_info "A desktop restore is already in progress; waiting up to ${follow_max}s for it to finish."
+            if ! flock -w "$follow_max" 201; then
+                exec 201>&-
+                ui_log_warn "The other desktop restore is still running (state: $(deep_state_get state "?"))." \
+                    "Follow it with: tail -f ${DEEP_LOG_FILE}"
+                return 4
+            fi
+        else
+            exec 201>&-
+            ui_log_fail "Another deep-mode transition (${holder}) holds $DEEP_LOCK_FILE." "Wait and retry 'oma-server disable'."
+            return 1
+        fi
     fi
     # L3: a concurrent exit may have finished while we waited for the lock; never
     # restart the desktop it just brought back.
@@ -1407,6 +1438,31 @@ deep_shell_block_wellformed() {
 }
 
 # Sets or adds `key = "value"` inside [deep] (atomic rewrite, keeps comments).
+# True when `key = ...` exists inside [deep].
+deep_config_has_key() {
+    local file="$1" key="$2"
+    awk -v k="$key" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { s=$0; gsub(/[[:space:]]/,"",s); in_sec=(s=="[deep]"); next }
+        in_sec && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { found=1; exit }
+        END { exit found ? 0 : 1 }' "$file" 2>/dev/null
+}
+
+# Removes `key = ...` from [deep] (atomic rewrite, keeps the file mode).
+deep_config_unset_key() {
+    local file="$1" key="$2" tmp
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    deep_tmp_guard "$tmp"
+    awk -v k="$key" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { s=$0; gsub(/[[:space:]]/,"",s); in_sec=(s=="[deep]"); print; next }
+        in_sec && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { next }
+        { print }' "$file" > "$tmp" || { rm -f "$tmp"; deep_tmp_release; return 1; }
+    if ! chmod --reference="$file" "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"; deep_tmp_release; return 1
+    fi
+    deep_tmp_release
+}
+
 deep_config_set_string() {
     local file="$1" key="$2" val="$3" tmp
     [[ -f "$file" && ! -L "$file" ]] || { ui_log_fail "Config '$file' missing or a symlink."; return 1; }
@@ -1534,6 +1590,7 @@ deep_shell_cmd() {
     # INFO-10: remember the old command so a failed `shell` write never leaves a new
     # shell_command live (when the current choice is already custom) while we report failure.
     local old_cmd; old_cmd=$(config_get_scalar "$config_file" "deep" "shell_command" "")
+    local had_cmd=0; deep_config_has_key "$config_file" "shell_command" && had_cmd=1
     local cmd_written=0 cfg_ok=1
     if [[ "$choice" == custom ]]; then
         if deep_config_set_string "$config_file" "shell_command" "$2"; then cmd_written=1; else cfg_ok=0; fi
@@ -1542,7 +1599,16 @@ deep_shell_cmd() {
         cfg_ok=0
     fi
     if (( ! cfg_ok )); then
-        if (( cmd_written )) && ! deep_config_set_string "$config_file" "shell_command" "$old_cmd"; then
+        local restored=1
+        if (( cmd_written )); then
+            if (( had_cmd )); then
+                deep_config_set_string "$config_file" "shell_command" "$old_cmd" || restored=0
+            else
+                # No key before: drop it rather than leave shell_command = "".
+                deep_config_unset_key "$config_file" "shell_command" || restored=0
+            fi
+        fi
+        if (( ! restored )); then
             ui_log_warn "Could not restore the previous [deep] shell_command in '$config_file'; check it by hand."
         fi
         [[ "$current" == none ]] && deep_shell_profile_remove "$prof" >/dev/null 2>&1

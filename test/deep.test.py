@@ -2370,9 +2370,12 @@ class SeventhPassTests(DeepSandbox):
     def test_l3_guard_is_right_after_flock(self):
         src = (ROOT / "lib/deep.sh").read_text()
         body = src.split("deep_exit_transaction() {", 1)[1]
-        after = body.split("if ! flock -w 10 201; then", 1)[1].split("fi", 1)[1]
-        first = [l.strip() for l in after.splitlines() if l.strip() and not l.strip().startswith("#")][0]
+        lock_block = body.split('if ! flock -w "$lock_wait" 201; then', 1)[1].split("\n    fi\n", 1)
+        first = [l.strip() for l in lock_block[1].splitlines() if l.strip() and not l.strip().startswith("#")][0]
         self.assertTrue(first.startswith("deep_state_exists || { exec 201>&-;"), first)
+        # every successful path through the lock block ends at that guard (no state change inside)
+        self.assertNotIn("deep_state_set", lock_block[0])
+        self.assertNotIn("deep_helper_root", lock_block[0])
 
     # ---- INFO-9 ----
     def test_info9_console_on_stdout_only_is_detected(self):
@@ -2529,6 +2532,117 @@ get_quickshell_telemetry
         readme = (ROOT / "README.md").read_text()
         self.assertIn("OMA_DEEP_SHELL_WAIT", readme)
         self.assertIn("tuios daemon", readme)
+
+
+class NinthPassTests(DeepSandbox):
+    """Quill/Sam notes @ b88c75d: busy-lock disable, shell_command rollback, cgroup-root gate."""
+
+    def dm_calls(self):
+        return [c for c in self.calls() if "deep-helper dm-" in c and c.startswith("sudo")]
+
+    def hold_lock_then(self, state, after, release_after=2.0, extra=None):
+        """Hold deep.lock with deep.json in `state`; after `release_after` s call after() and release."""
+        import fcntl, time
+        self.install_helper()
+        self.write_deep_state(state=state)
+        self.enter_desktop_down()
+        fh = open(self.deep_dir / "deep.lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        env = {"OMA_DEEP_LOCK_WAIT": "1"}
+        env.update(extra or {})
+        proc = subprocess.Popen([str(OMA_BIN), "disable"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=self.env(env))
+        try:
+            time.sleep(release_after)
+            after()
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+        out, _ = proc.communicate(timeout=60)
+        return proc.returncode, ANSI_RE.sub("", out)
+
+    def test_second_disable_waits_for_running_restore_and_reports_success(self):
+        def finish_first():
+            (self.deep_dir / "deep.json").unlink()
+            (self.deep_dir / "last-deep.json").write_text('{"result":"exited"}')
+        rc, out = self.hold_lock_then("DEEP_EXITING", finish_first)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("already in progress", out)
+        self.assertIn("Already restored", out)
+        self.assertNotIn("Another deep-mode transition", out)
+        self.assertNotRegex(out, r"\bFAIL\b")
+        self.assertEqual(self.dm_calls(), [])
+
+    def test_second_disable_retries_when_first_restore_degraded(self):
+        def first_degraded():
+            self.write_deep_state(state="DEEP_DEGRADED")
+        rc, out = self.hold_lock_then("DEEP_EXITING", first_degraded)
+        self.assertIn("already in progress", out)
+        self.assertEqual(rc, 0, out)                  # it ran the exit itself and succeeded
+        self.assertTrue(self.dm_calls(), self.calls())
+        self.assertIsNone(self.deep_state())
+
+    def test_second_disable_times_out_without_fail(self):
+        rc, out = self.hold_lock_then("DEEP_EXITING", lambda: None, release_after=4.0,
+                                      extra={"OMA_DEEP_FOLLOW_SECONDS": "1"})
+        self.assertEqual(rc, 4, out)
+        self.assertIn("still running", out)
+        self.assertNotIn("Another deep-mode transition", out)
+        self.assertEqual(self.deep_state()["state"], "DEEP_EXITING")
+        self.assertEqual(self.dm_calls(), [])
+
+    def test_disable_during_enter_still_fails(self):
+        rc, out = self.hold_lock_then("DEEP_ENTERING", lambda: None, release_after=2.0)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("Another deep-mode transition (DEEP_ENTERING)", out)
+        self.assertEqual(self.dm_calls(), [])
+
+    def test_lock_wait_override_needs_test_root(self):
+        src = (ROOT / "lib/deep.sh").read_text()
+        self.assertIn('[[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && "${OMA_DEEP_LOCK_WAIT:-}" =~ ^[0-9]+$ ]]', src)
+
+    # ---- shell_command rollback drops a key that did not exist ----
+    def test_rollback_drops_new_shell_command_key(self):
+        cfg = "\n".join(l for l in self.cfg.read_text().splitlines() if not l.strip().startswith("shell_command")) + "\n"
+        self.cfg.write_text(cfg)
+        write_executable(self.bin / "awk", """#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "k=shell" ]] && exit 1; done
+exec /usr/bin/awk "$@"
+""")
+        res = self.cli("deep-shell", "custom", "--command", "top -d 2")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("rolled back", res.plain)
+        self.assertNotRegex(self.cfg.read_text(), r"(?m)^\s*shell_command\s*=")
+        self.assertEqual(self.cfg.read_text(), cfg)
+        self.assertEqual([p.name for p in self.cfg_dir.iterdir() if p.name.startswith("config.toml.")], [])
+
+    # ---- INFO-12: fake cgroup root needs the guarded test root ----
+    def session_bound(self, with_root):
+        cg = self.base / "cgroup"
+        uid = os.getuid()
+        scope = cg / f"user.slice/user-{uid}.slice/user@{uid}.service/app.slice/app-x-1.scope"
+        scope.mkdir(parents=True, exist_ok=True)
+        agent = subprocess.Popen(["sleep", "30"])
+        try:
+            (scope / "cgroup.procs").write_text(f"{agent.pid}\n")
+            env = self.env({"OMA_SERVER_TEST_MODE": "1", "OMA_SERVER_TEST_CGROUP_ROOT": str(cg)})
+            if not with_root:
+                env.pop("OMA_SERVER_TEST_ROOT")
+            res = subprocess.run(["bash", "-c", f'source "{ROOT}/lib/deep.sh"; deep_list_session_bound_procs ""'],
+                                 capture_output=True, text=True, env=env, timeout=20)
+        finally:
+            agent.kill(); agent.wait()
+        return agent.pid, res.stdout
+
+    def test_info12_cgroup_root_ignored_without_test_root(self):
+        pid, out = self.session_bound(with_root=False)
+        self.assertNotIn(f"{pid}\tsleep", out)
+
+    def test_info12_cgroup_root_used_with_test_root(self):
+        pid, out = self.session_bound(with_root=True)
+        self.assertIn(f"{pid}\tsleep", out)
+
+    def test_readme_tuios_is_modal(self):
+        self.assertIn("press `i` to start typing", (ROOT / "README.md").read_text())
 
 
 if __name__ == "__main__":
