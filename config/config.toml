@@ -5,7 +5,7 @@
 default_mode = "host"
 dpms_off_on_enable = true
 auto_wake_on_input = true
-quickshell_strategy = "sigstop"
+quickshell_strategy = "sigstop"    # only "sigstop" is implemented; other values warn and fall back
 default_timeout = "0"              # "0" = infinite, or e.g. "2h", "45m"
 
 [inhibit]
@@ -26,3 +26,20 @@ services = [
   "pipewire.service",
   "wireplumber.service"
 ]
+
+[deep]
+# Deep Server Mode (opt-in): stops Hyprland and the display manager, keeps SSH/docker/user services.
+# `oma-server deep-setup` flips `allowed` to true; `enable --deep` refuses while it is false.
+# There is deliberately no key to close apps or to force a timeout.
+allowed = false
+stop_display_manager = true
+exit_wait_seconds = 45             # how long `disable` waits for Hyprland to come back
+job_wait_seconds = 180             # if uwsm refuses to stop because a user start job is queued, wait this long (0-600) for the queue to drain, then retry once
+require_ssh = true                 # refuse unless sshd.service is active
+# Console on tty1 while in Deep Server Mode. "none" (default) = plain text console with a
+# `login:` prompt, like Ubuntu Server. Opt in with `oma-server deep-shell <name>`:
+# tmux | btop | tuios (advanced) | custom (runs shell_command); zellij also works.
+# Only an interactive login on tty1 is affected (never SSH); any key within 3 s skips it,
+# and quitting, a crash or a missing program leaves you in the plain shell.
+shell = "none"
+shell_command = ""

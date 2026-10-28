@@ -1,4 +1,9 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
+# Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # ~/.config/omarchy/hooks/post-boot.d/99-server-profile-check.sh
 # Post-boot and session recovery hook for oma-server (Omarchy Server-Mode).
 # Guarantees that any unexpected reboot, crash, or session restart cleanly
@@ -11,6 +16,44 @@ if ! [[ "$CURRENT_UID" =~ ^[0-9]+$ ]] || (( CURRENT_UID == 0 )); then
 fi
 
 RUN_DIR="/run/user/${CURRENT_UID}/omarchy-server-mode"
+
+# --- Deep Server Mode -------------------------------------------------------
+# This hook fires ~2s after Hyprland starts, i.e. also in the middle of a deep
+# exit. While the exit runs (state DEEP_EXITING or deep.lock held) it owns all
+# cleanup, so do nothing at all. Otherwise (root backup timer, reboot, or a manual
+# login after DEEP_DEGRADED) let the CLI reconcile/finish the exit.
+DEEP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server"
+if [[ -f "$DEEP_DIR/deep.json" && ! -L "$DEEP_DIR/deep.json" ]]; then
+    deep_state=$(jq -r '.state // ""' "$DEEP_DIR/deep.json" 2>/dev/null || true)
+    if [[ "$deep_state" == "DEEP_EXITING" || "$deep_state" == "DEEP_ENTERING" ]]; then
+        exit 0
+    fi
+    if [[ -f "$DEEP_DIR/deep.lock" ]] && ! flock -n "$DEEP_DIR/deep.lock" true 2>/dev/null; then
+        exit 0
+    fi
+    oma_cli="$(command -v oma-server 2>/dev/null || true)"
+    [[ -z "$oma_cli" && -x "$HOME/.local/bin/oma-server" ]] && oma_cli="$HOME/.local/bin/oma-server"
+    if [[ -n "$oma_cli" ]]; then
+        # Reconciles a boot_id change (reboot) and finishes DEEP_SERVER/DEEP_DEGRADED exits.
+        # Run it outside the session cgroup so that stopping/restarting session units
+        # can never take this cleanup (or the fresh session) down with it.
+        # Unique unit per boot and run (a leftover failed unit can never block the name),
+        # and clear old failed ones first.
+        boot_tag=$(tr -dc '0-9a-f' < /proc/sys/kernel/random/boot_id 2>/dev/null | head -c 8 || true)
+        postboot_unit="oma-server-deep-postboot-${boot_tag:-noboot}-$(date +%s)-$$"
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemctl --user reset-failed 'oma-server-deep-postboot*' >/dev/null 2>&1 || true
+        fi
+        if command -v systemd-run >/dev/null 2>&1 && \
+           systemd-run --user --quiet --collect --unit="$postboot_unit" \
+               "$oma_cli" __deep-post-boot >/dev/null 2>&1; then
+            :
+        else
+            "$oma_cli" __deep-post-boot >/dev/null 2>&1 || true
+        fi
+    fi
+    exit 0
+fi
 
 _verify_and_terminate_pid() {
     local pid_file="$1"

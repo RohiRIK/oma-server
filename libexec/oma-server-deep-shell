@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# oma-server-deep-shell -- optional TUI on the Deep Server Mode console (tty1).
+#
+# Default is "none": the plain Linux console with a real `login:` prompt, like
+# Ubuntu Server. Nothing here runs unless the user opted in with
+# `oma-server deep-shell <name>`, which adds a small managed block to the login
+# profile (~/.bash_profile, or ~/.zprofile for zsh) that calls `... login`.
+#
+# Safety contract:
+#   * Runs as the logged-in user only. Nothing root-owned, no sudo.
+#   * Acts only on an interactive login on /dev/tty1, while deep.json says
+#     DEEP_SERVER, never over SSH, never nested inside tmux/zellij/itself.
+#   * Never `exec`s: the TUI is a child of the login shell, so quitting it,
+#     crashing, or a missing binary always lands in the plain shell.
+#   * 3-second escape hatch: press any key to skip the TUI for this login.
+#   * Runs at most once per login (no restart loop).
+set -uo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode/config.toml"
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server/deep.json"
+SUPPORTED="none tmux btop tuios zellij custom"
+# Skip window in seconds (tests shorten it); validated before use.
+SKIP_WAIT="${OMA_DEEP_SHELL_WAIT:-3}"
+[[ "$SKIP_WAIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || SKIP_WAIT=3
+CONSOLE_TTY="/dev/tty1"
+
+# [deep] <key> = "value" (same rules as lib/config.sh config_get_scalar)
+cfg() {
+    local key="$1" def="$2" v=""
+    [[ -r "$CONFIG_FILE" ]] && v=$(awk -v k="$key" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { s=$0; gsub(/[[:space:]]/,"",s); in_sec=(s=="[deep]"); next }
+        in_sec && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+            sub("^[[:space:]]*" k "[[:space:]]*=[[:space:]]*", "")
+            if ($0 ~ /^"/) { sub(/^"/, ""); sub(/".*$/, "") } else { sub(/[[:space:]]*#.*$/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "") }
+            print; exit
+        }' "$CONFIG_FILE" 2>/dev/null)
+    printf '%s' "${v:-$def}"
+}
+
+# Prints the argv for a choice, one word per line. Empty = plain shell.
+resolve() {
+    case "$1" in
+        none|"")  return 0 ;;
+        tmux)     printf '%s\n' tmux new-session -A -s deep ;;
+        zellij)   printf '%s\n' zellij attach --create deep ;;
+        tuios)    printf '%s\n' tuios ;;
+        btop)     printf '%s\n' btop ;;
+        custom)   local c; c=$(cfg shell_command "")
+                  [[ -n "$c" ]] && printf '%s\n' bash -c "$c" ;;
+        *)        return 1 ;;
+    esac
+}
+
+in_deep_server() {
+    [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ "$(jq -r '.state // empty' "$STATE_FILE" 2>/dev/null)" == "DEEP_SERVER" ]]
+}
+
+note() { printf '\033[1moma-server:\033[0m %s\n' "$*"; }
+
+cmd_login() {
+    # --- guards: any failure means "do nothing", the plain shell continues ---
+    [[ -t 0 && -t 1 ]] || return 0
+    [[ "$(tty 2>/dev/null)" == "$CONSOLE_TTY" ]] || return 0
+    [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] || return 0
+    [[ -z "${OMA_DEEP_SHELL_ACTIVE:-}${TMUX:-}${ZELLIJ:-}" ]] || return 0
+    in_deep_server || return 0
+
+    local choice; choice=$(cfg shell none)
+    [[ "$choice" == "none" ]] && return 0
+    local -a argv=()
+    mapfile -t argv < <(resolve "$choice") || true
+    if [[ " $SUPPORTED " != *" $choice "* ]] || (( ${#argv[@]} == 0 )); then
+        note "[deep] shell = \"$choice\" is not usable; staying in the plain shell."
+        return 0
+    fi
+    if [[ "$choice" == custom ]]; then
+        # Check the custom command's own program, not bash (skip VAR=value prefixes).
+        local w prog="" words=()
+        read -ra words <<< "${argv[2]}"
+        for w in "${words[@]}"; do
+            [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+            prog="$w"; break
+        done
+        if [[ -n "$prog" ]] && ! command -v "$prog" >/dev/null 2>&1; then
+            note "custom command '$prog' is not installed; staying in the plain shell."
+            return 0
+        fi
+    fi
+    if ! command -v "${argv[0]}" >/dev/null 2>&1; then
+        note "'${argv[0]}' is not installed; staying in the plain shell."
+        return 0
+    fi
+
+    note "Deep Server Mode console. Starting $choice in ${SKIP_WAIT} s, press any key for the plain shell."
+    note "Bring the desktop back any time with: oma-server disable"
+
+    if read -rsn1 -t "$SKIP_WAIT" _; then
+        note "Skipped $choice for this login."
+        return 0
+    fi
+
+    export OMA_DEEP_SHELL_ACTIVE=1
+    local rc=0
+    "${argv[@]}" || rc=$?
+    unset OMA_DEEP_SHELL_ACTIVE
+    stty sane 2>/dev/null || true
+    printf '\033[0m'
+    # Clear only after a clean exit; after a failure keep its error message visible.
+    if (( rc == 0 )); then clear 2>/dev/null || true; fi
+    if (( rc == 0 )); then
+        note "$choice exited. You are in the plain shell (desktop is still off)."
+    else
+        note "$choice ended with code $rc. You are in the plain shell (desktop is still off)."
+    fi
+    note "Type 'oma-server disable' to bring the desktop back, or 'logout'."
+    return 0
+}
+
+cmd_print() {
+    local choice; choice=$(cfg shell none)
+    local -a argv=(); mapfile -t argv < <(resolve "$choice") || true
+    printf 'shell=%s command=%s\n' "$choice" "${argv[*]:-<plain shell>}"
+}
+
+case "${1:-}" in
+    login) cmd_login ;;
+    print) cmd_print ;;
+    *) printf 'usage: oma-server-deep-shell login|print\n' >&2; exit 2 ;;
+esac

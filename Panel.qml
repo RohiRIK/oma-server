@@ -39,6 +39,10 @@ Panel {
   property string healthStatus: "OK"
   property bool loaded: false
 
+  // Deep Server Mode (opt-in; set up with `oma-server deep-setup`)
+  property bool deepAllowed: false
+  property string deepNotice: ""
+
   // Interactive Controls & Async Progress State
   property string selectedTimeout: "0"
   readonly property var timeoutPresets: [
@@ -147,6 +151,20 @@ Panel {
           root.protectedActive = Number(data.protected_active) || 0
           root.protectedTotal = Number(data.protected_total) || 10
           root.healthStatus = String(data.health || "OK")
+          root.deepAllowed = data.deep_allowed === true
+          root.deepNotice = ""
+          var ld = data.last_deep
+          if (ld && (ld.result === "exited" || ld.result === "greeter") && ld.exited_at) {
+            var ageSec = Math.floor(Date.now() / 1000) - Number(ld.exited_at)
+            if (ageSec >= 0 && ageSec < 600) {
+              var dur = Number(ld.duration_seconds) || 0
+              var h = Math.floor(dur / 3600)
+              var m = Math.floor((dur % 3600) / 60)
+              var freed = (ld.freed_mb !== null && ld.freed_mb !== undefined)
+                ? (" · freed " + (Number(ld.freed_mb) / 1024).toFixed(1) + " GiB") : ""
+              root.deepNotice = "Back from Deep Server · " + h + "h" + (m < 10 ? "0" : "") + m + "m" + freed
+            }
+          }
           root.loaded = true
           if (root.healthStatus === "DEGRADED" && root.errorNotice === "") {
             root.errorNotice = "Inhibitor process is stale while Homelab snapshot is active."
@@ -413,6 +431,18 @@ Panel {
             }
           }
 
+          // ---------- 2b. Deep Server return notice ----------
+          Text {
+            visible: root.deepNotice !== ""
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            text: root.deepNotice
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: root.dim
+          }
+
           // ---------- 3. Error / Degraded Notice ----------
           Rectangle {
             visible: root.errorNotice !== ""
@@ -603,6 +633,26 @@ Panel {
               tooltipText: "Emergency recovery: unfreeze Quickshell, wake displays, purge locks"
               onClicked: root.runRescue()
             }
+          }
+
+          // ---------- 8. Deep Server Mode (opt-in, always via a terminal) ----------
+          // Never one-click: confirmation, any typed 'yes' and sudo prompts happen
+          // in Omarchy's floating terminal, like its own setup actions.
+          Button {
+            width: parent.width
+            enabled: !root.isTransitioning && !root.isHomelabMode
+            fontSize: Style.font.bodySmall
+            verticalPadding: Style.spacing.controlPaddingY
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            text: root.deepAllowed ? "Deep Server Mode…" : "Set up Deep Server Mode…"
+            tooltipText: root.deepAllowed
+              ? "Stop the desktop and greeter (headless). Shows the plan first; open windows need a typed 'yes'."
+              : "Run 'oma-server deep-setup' in a terminal (installs a fixed-verb root helper; sudo prompt)."
+            onClicked: root.deepAllowed
+              ? root.inTerminal("'oma-server diff --deep && oma-server enable --deep'")
+              : root.inTerminal("'oma-server deep-setup'")
           }
         }
       }

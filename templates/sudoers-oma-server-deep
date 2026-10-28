@@ -1,0 +1,14 @@
+# /etc/sudoers.d/oma-server-deep -- installed only by `oma-server deep-setup` (opt-in).
+# oma-server Deep Server Mode stops and restarts the graphical session, so the way back runs from SSH,
+# a TTY, or a root timer with no terminal or polkit agent to carry a prompt. Every verb is spelled out;
+# revert-arm takes digits only and the helper revalidates them (5..604920).
+# Remove with: oma-server deep-setup --remove
+%wheel ALL=(root) NOPASSWD: /usr/local/lib/oma-server/deep-helper check, \
+    /usr/local/lib/oma-server/deep-helper dm-stop, \
+    /usr/local/lib/oma-server/deep-helper dm-start, \
+    /usr/local/lib/oma-server/deep-helper dm-restart, \
+    /usr/local/lib/oma-server/deep-helper inhibit-start, \
+    /usr/local/lib/oma-server/deep-helper inhibit-stop, \
+    /usr/local/lib/oma-server/deep-helper revert-disarm, \
+    /usr/local/lib/oma-server/deep-helper exit, \
+    /usr/local/lib/oma-server/deep-helper ^revert-arm [1-9][0-9]{0\,5}$

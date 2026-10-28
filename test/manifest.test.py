@@ -56,6 +56,10 @@ class ManifestTests(unittest.TestCase):
             "lib/config.sh",
             "lib/snapshot.sh",
             "lib/transition.sh",
+            "lib/deep.sh",
+            "libexec/oma-server-deep-helper",
+            "libexec/oma-server-deep-shell",
+            "templates/sudoers-oma-server-deep",
             "config/config.toml",
             "hooks/post-boot.d/99-server-profile-check.sh",
         )
@@ -85,6 +89,8 @@ class PackagingAndQmlContractTests(unittest.TestCase):
             ROOT / "bin/oma-server",
             ROOT / "bin/omarchy-server-mode",
             ROOT / "hooks/post-boot.d/99-server-profile-check.sh",
+            ROOT / "libexec/oma-server-deep-helper",
+            ROOT / "libexec/oma-server-deep-shell",
             *sorted((ROOT / "lib").glob("*.sh")),
         ]
         for script in scripts:

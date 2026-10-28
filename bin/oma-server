@@ -1,9 +1,15 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: privileged mode never imports exported functions (BASH_FUNC_*%%), BASH_ENV,
+# ENV or SHELLOPTS from the caller, so nothing can shadow sudo/type/realpath here.
+# Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # ~/.config/omarchy/plugins/server-mode/bin/omarchy-server-mode
 # Enterprise CLI coordinator for oma-server (Omarchy Server-Mode)
 set -euo pipefail
 
-readonly OMA_SERVER_VERSION="1.1.1"
+readonly OMA_SERVER_VERSION="1.2.0"
 
 # omarchy-shell / omarchy-plugin-catalog need OMARCHY_PATH; it is only set inside
 # the graphical session, so default it for plain SSH / non-login shells.
@@ -23,13 +29,14 @@ CMD_NAME="$(basename "$0")"
 REAL_SCRIPT="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$REAL_SCRIPT")" &>/dev/null && pwd)"
 PLUGIN_ROOT="$(cd -- "$SCRIPT_DIR/.." &>/dev/null && pwd)"
-CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode/config.toml"
+USER_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/server-mode/config.toml"
+CONFIG_FILE="$USER_CONFIG_FILE"
 if [[ ! -f "$CONFIG_FILE" && -f "$PLUGIN_ROOT/config/config.toml" ]]; then
     CONFIG_FILE="$PLUGIN_ROOT/config/config.toml"
 fi
 LIB_DIR="$PLUGIN_ROOT/lib"
 
-for lib_mod in ui.sh config.sh snapshot.sh transition.sh; do
+for lib_mod in ui.sh config.sh snapshot.sh transition.sh deep.sh; do
     if [[ ! -f "$LIB_DIR/$lib_mod" ]]; then
         printf "[ FAIL ] Required library '%s/%s' not found.\n" "$LIB_DIR" "$lib_mod" >&2
         exit 1
@@ -45,6 +52,75 @@ CURRENT_UID="${UID:-$(id -u)}"
 RUN_DIR="${OMA_SERVER_RUN_DIR:-/run/user/${CURRENT_UID}/omarchy-server-mode}"
 SNAPSHOT_FILE="$RUN_DIR/active-snapshot.json"
 LOCK_FILE="$RUN_DIR/lock"
+
+# A reboot while in Deep Server Mode already brought the desktop back: clear stale deep state.
+deep_reconcile_boot || true
+
+# Deep Server Mode status (DEEP_ENTERING / DEEP_SERVER / DEEP_EXITING / DEEP_DEGRADED)
+# [profile] quickshell_strategy: only "sigstop" is implemented (lib/snapshot.sh and
+# lib/transition.sh always pause the shell with SIGSTOP). Say so instead of silently
+# ignoring another value.
+resolve_quickshell_strategy() {
+    local s
+    s="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+    if [[ "${s,,}" != "sigstop" ]]; then
+        ui_log_warn "[profile] quickshell_strategy = \"${s}\" is not supported; using \"sigstop\" (the only implemented strategy)." >&2
+    fi
+    printf "sigstop"
+}
+
+deep_status() {
+    local as_json="$1"
+    local state entered now elapsed tlabel tepoch timeout_status="Disabled (no --timeout)" health="OK"
+    state=$(deep_state_get state "DEEP_SERVER")
+    entered=$(deep_state_get entered_at "0")
+    [[ "$entered" =~ ^[0-9]+$ ]] || entered=0
+    now=$(date +%s)
+    elapsed=$(( now - entered )); (( elapsed < 0 )) && elapsed=0
+    tlabel=$(deep_state_get timeout_label "")
+    tepoch=$(deep_state_get timeout_epoch "")
+    if [[ "$tepoch" =~ ^[0-9]+$ ]]; then
+        if (( tepoch > now )); then
+            timeout_status="Active (${tlabel}, $(ui_format_duration_human $(( tepoch - now ))) left)"
+        else
+            timeout_status="Expired (${tlabel})"
+        fi
+    fi
+    local hint=""
+    if [[ "$state" == "DEEP_DEGRADED" ]]; then
+        health="DEGRADED"
+    elif [[ "$state" == "DEEP_EXITING" || "$state" == "DEEP_ENTERING" ]] && ! deep_lock_held; then
+        # A transition state with nobody holding deep.lock: its worker died.
+        health="DEGRADED"
+        hint="stale ${state} (no transition running); run 'oma-server disable' to finish"
+    fi
+    local since; since=$(date -d "@$entered" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "epoch:$entered")
+    if [[ "$as_json" == "true" ]]; then
+        jq -n --arg mode "$state" --arg since "$since" --argjson el "$elapsed" \
+            --arg eh "$(ui_format_duration_human "$elapsed")" --arg ts "$timeout_status" --arg health "$health" \
+            --arg rt "$DEEP_STATE_FILE" --arg hint "$hint" '{
+                mode: $mode, is_homelab: false, is_deep: true, since: $since,
+                elapsed_seconds: $el, elapsed_human: $eh,
+                inhibitor: "Active (root, oma-server-deep-inhibit)", timeout: null,
+                timeout_status: $ts, timeout_remaining: "", dpms: "N/A (no session)",
+                quickshell: "Stopped (Deep Server)", protected_active: 0, protected_total: 0,
+                health: $health, runtime_state: $rt, health_hint: $hint
+            }'
+        return 0
+    fi
+    echo ""
+    ui_log_info "Mode        : ${state}"
+    ui_log_info "Since       : ${since} ($(ui_format_duration_human "$elapsed"))"
+    ui_log_info "Auto-revert : ${timeout_status}"
+    ui_log_info "State file  : ${DEEP_STATE_FILE}"
+    if [[ -n "$hint" ]]; then
+        ui_log_warn "Health      : DEGRADED, ${hint}." "Or '${DEEP_PANIC_HINT}'."
+    elif [[ "$health" == "DEGRADED" ]]; then
+        ui_log_warn "The last exit did not bring the desktop back." "Run '$CMD_NAME disable' again, or '${DEEP_PANIC_HINT}'."
+    else
+        ui_log_info "Way back    : '$CMD_NAME disable' (SSH or Ctrl+Alt+F2), reboot, or '${DEEP_PANIC_HINT}'"
+    fi
+}
 
 # 4. Helper: Gather Live Telemetry for Status & JSON Output
 collect_status_telemetry() {
@@ -246,11 +322,16 @@ print_usage() {
     ui_box_line "$w" "$(printf "    %-24s %s" "enable [options]" "Transition from HOST_LAPTOP to HOMELAB_MODE")"
     ui_box_line "$w" "$(printf "    %-24s %s" "disable" "Restore full desktop session & release locks")"
     ui_box_line "$w" "$(printf "    %-24s %s" "rescue" "Force emergency recovery to safe baseline")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "deep-setup [--remove]" "Opt-in: install/remove Deep Server root helper")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "diff --deep" "Show the Deep Server plan (windows, units)")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "deep-shell [name]" "Deep console: none|tmux|btop|tuios|zellij|custom")"
     printf "%s├%s┤%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
     ui_box_line "$w" "  ${UI_BOLD}${UI_MUTED}ENABLE OPTIONS:${UI_RESET}"
     ui_box_line "$w" "$(printf "    %-24s %s" "--dry-run" "Simulate transition in memory without changes")"
     ui_box_line "$w" "$(printf "    %-24s %s" "-y, --yes" "Skip interactive confirmation prompt")"
     ui_box_line "$w" "$(printf "    %-24s %s" "--timeout <duration>" "Auto-revert Dead Man's Switch (e.g. 45m, 2h)")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "--deep" "DEEP_SERVER: stop desktop + greeter (no -y)")"
+    ui_box_line "$w" "$(printf "    %-24s %s" "--close-apps" "With --deep: close open windows (type 'yes')")"
     printf "%s└%s┘%s\n" "${UI_CYAN}" "$(ui_hr "$w")" "${UI_RESET}"
 }
 
@@ -273,17 +354,56 @@ case "$cmd" in
                     ;;
             esac
         done
-        collect_status_telemetry "$as_json"
+        deep_allowed="$(config_get_bool "$CONFIG_FILE" "deep" "allowed" "false")"
+        last_deep="null"
+        if [[ -f "$DEEP_LAST_FILE" ]] && jq -e 'type == "object"' "$DEEP_LAST_FILE" >/dev/null 2>&1; then
+            last_deep="$(jq -c . "$DEEP_LAST_FILE")"
+        fi
+        # N4: deep is allowed in config but the root helper is gone (e.g. an orphaned
+        # grant): enable --deep would refuse, so say so instead of reporting OK.
+        deep_helper_ok="true"
+        deep_helper_hint=""
+        if [[ "$deep_allowed" == "true" ]] && ! deep_helper_installed; then
+            deep_helper_ok="false"
+            # M-new-1: a stale helper (hash differs from the pin) is reported, not trusted.
+            deep_helper_hint="$(deep_helper_problem); run '$CMD_NAME deep-setup' or '$CMD_NAME deep-setup --remove'"
+        fi
+        if [[ "$as_json" == "true" ]]; then
+            if deep_state_exists; then
+                status_json="$(deep_status true)"
+            else
+                status_json="$(collect_status_telemetry true)"
+            fi
+            printf "%s" "$status_json" | jq --argjson allowed "$deep_allowed" --argjson last "$last_deep" \
+                --argjson hok "$deep_helper_ok" --arg hhint "$deep_helper_hint" \
+                '. + {is_deep: (.is_deep // false), deep_allowed: $allowed, last_deep: $last, deep_helper_ok: $hok}
+                 | if $hok then . else .health = "DEGRADED"
+                     | .health_hint = ([(.health_hint // ""), $hhint] | map(select(length > 0)) | join("; ")) end'
+            exit 0
+        fi
+        if deep_state_exists; then
+            deep_status false
+        else
+            collect_status_telemetry false
+        fi
+        if [[ "$deep_helper_ok" != "true" ]]; then
+            ui_log_warn "Health      : DEGRADED, ${deep_helper_hint}." \
+                "[deep] allowed = true, but $DEEP_HELPER_PATH is missing, unsafe or outdated, so 'enable --deep' refuses."
+        fi
         exit 0
         ;;
 
     diff)
         shift || true
+        if [[ "${1:-}" == "--deep" && $# -eq 1 ]]; then
+            deep_render_plan "$CONFIG_FILE"
+            exit 0
+        fi
         if [[ $# -gt 0 ]]; then
             ui_log_fail "Unexpected argument '$1' for 'diff' command." "Run '$CMD_NAME diff' with no arguments."
             exit 1
         fi
-        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        qs_strategy="$(resolve_quickshell_strategy)"
         snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
         mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
         ui_render_diff_panel "$snapshot_in_memory" "" "${services[@]}"
@@ -294,6 +414,8 @@ case "$cmd" in
         is_dry_run="false"
         skip_confirm="false"
         timeout_arg=""
+        deep_mode="false"
+        close_apps="false"
         shift || true
 
         while [[ $# -gt 0 ]]; do
@@ -304,6 +426,14 @@ case "$cmd" in
                     ;;
                 -y|--yes)
                     skip_confirm="true"
+                    shift
+                    ;;
+                --deep)
+                    deep_mode="true"
+                    shift
+                    ;;
+                --close-apps)
+                    close_apps="true"
                     shift
                     ;;
                 --timeout)
@@ -326,11 +456,38 @@ case "$cmd" in
                     ;;
                 *)
                     ui_log_fail "Unknown option '$1' for 'enable' command." \
-                        "Valid options: --dry-run, -y, --yes, --timeout <duration>."
+                        "Valid options: --dry-run, -y, --yes, --timeout <duration>, --deep, --close-apps."
                     exit 1
                     ;;
             esac
         done
+
+        if [[ "$close_apps" == "true" && "$deep_mode" != "true" ]]; then
+            ui_log_fail "'--close-apps' is only valid with '--deep'."
+            exit 1
+        fi
+
+        if deep_state_exists; then
+            ui_log_fail "Deep Server Mode state is active ($(deep_state_get state UNKNOWN))." "Run '$CMD_NAME disable' first."
+            exit 1
+        fi
+
+        if [[ "$deep_mode" == "true" ]]; then
+            if [[ "$skip_confirm" == "true" ]]; then
+                ui_log_fail "'-y/--yes' is not accepted with '--deep'." \
+                    "Deep Server Mode has no confirmation bypass; open windows need --close-apps and a typed 'yes'."
+                exit 2
+            fi
+            if [[ "$is_dry_run" == "true" ]]; then
+                deep_render_plan "$CONFIG_FILE"
+                exit 0
+            fi
+            # Deep mode never uses [profile] default_timeout: a timer exists only with --timeout.
+            deep_timeout_seconds="$(parse_and_validate_timeout "${timeout_arg:-0}")"
+            deep_rc=0
+            deep_enter_transaction "$CONFIG_FILE" "$close_apps" "$deep_timeout_seconds" "${timeout_arg:-}" "$REAL_SCRIPT" || deep_rc=$?
+            exit "$deep_rc"
+        fi
 
         # Fallback to config default_timeout if not supplied on CLI
         if [[ -z "$timeout_arg" ]]; then
@@ -347,7 +504,7 @@ case "$cmd" in
             exit 0
         fi
 
-        qs_strategy="$(config_get_scalar "$CONFIG_FILE" "profile" "quickshell_strategy" "sigstop")"
+        qs_strategy="$(resolve_quickshell_strategy)"
         snapshot_in_memory="$(capture_snapshot "$qs_strategy")"
         mapfile -t services < <(get_whitelist_services "$CONFIG_FILE")
 
@@ -389,11 +546,14 @@ case "$cmd" in
             ui_log_fail "Atomic snapshot write/validation failed at '$SNAPSHOT_FILE'." \
                 "Verify free space in '$RUN_DIR' (tmpfs)."
             rm -f "$LOCK_FILE"
+            rmdir "$RUN_DIR" 2>/dev/null || true
             exit 1
         fi
 
         if ! apply_homelab_mode "$RUN_DIR" "$CONFIG_FILE" "$SNAPSHOT_FILE" "$timeout_seconds" "$timeout_arg" "$REAL_SCRIPT"; then
             rm -f "$LOCK_FILE"
+            # Failed-enable rollback leaves an empty runtime dir behind; drop it.
+            rmdir "$RUN_DIR" 2>/dev/null || true
             exit 1
         fi
 
@@ -423,6 +583,16 @@ case "$cmd" in
                     ;;
             esac
         done
+
+        if deep_state_exists; then
+            deep_rc=0
+            deep_from="$(deep_state_get state DEEP_SERVER)"
+            deep_exit_run "$CONFIG_FILE" "$is_auto_timeout" "$REAL_SCRIPT" || deep_rc=$?
+            if (( deep_rc == 0 )); then
+                ui_log_ok "Desktop restored: ${deep_from} -> HOST_LAPTOP."
+            fi
+            exit "$deep_rc"
+        fi
 
         if [[ ! -f "$SNAPSHOT_FILE" ]]; then
             ui_log_info "System is already operating in HOST_LAPTOP mode (no active snapshot)."
@@ -463,10 +633,64 @@ case "$cmd" in
     rescue)
         shift || true
         op_start_ms="$(ui_now_ms)"
+        if deep_state_exists; then
+            deep_exit_run "$CONFIG_FILE" "false" "$REAL_SCRIPT" || \
+                ui_log_warn "Deep Server exit did not complete." "Panic: ${DEEP_PANIC_HINT}"
+        fi
         force_rescue_mode "$RUN_DIR" "$SNAPSHOT_FILE"
         op_elapsed="$(ui_format_elapsed_ms "$op_start_ms")"
         echo ""
         ui_log_ok "Emergency rescue complete in ${op_elapsed}. System restored to safe baseline."
+        exit 0
+        ;;
+
+    deep-setup)
+        shift || true
+        case "${1:-}" in
+            "")
+                deep_setup "$PLUGIN_ROOT" "$USER_CONFIG_FILE"
+                exit $?
+                ;;
+            --remove)
+                deep_setup_remove "$USER_CONFIG_FILE"
+                exit $?
+                ;;
+            *)
+                ui_log_fail "Unknown option '$1' for 'deep-setup'." "Usage: $CMD_NAME deep-setup [--remove]"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    deep-shell)
+        shift || true
+        deep_shell_cmd "$PLUGIN_ROOT" "$USER_CONFIG_FILE" "$@"
+        exit $?
+        ;;
+
+    __deep-enter-worker)
+        deep_enter_worker "$CONFIG_FILE" "$REAL_SCRIPT"
+        exit $?
+        ;;
+
+    __deep-exit-worker)
+        # L1: started by deep_exit_run via systemd-run --user when disable/rescue ran on tty1.
+        deep_exit_transaction "$CONFIG_FILE" "false"
+        exit $?
+        ;;
+
+    __deep-post-boot)
+        # Called by the post-boot hook when Hyprland starts while deep state exists
+        # (root backup timer or a manual login after DEEP_DEGRADED): finish the exit.
+        if deep_state_exists; then
+            case "$(deep_state_get state "")" in
+                DEEP_SERVER|DEEP_DEGRADED)
+                    deep_lock_held && exit 0
+                    deep_exit_transaction "$CONFIG_FILE" "false"
+                    exit $?
+                    ;;
+            esac
+        fi
         exit 0
         ;;
 

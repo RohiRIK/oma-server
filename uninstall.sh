@@ -1,4 +1,9 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
+# bash -p: never import exported functions (BASH_FUNC_*%%), BASH_ENV, ENV or SHELLOPTS.
+# Re-exec under bash -p when started as `bash file` (omarchy-hook runs hooks that way),
+# so exported functions/SHELLOPTS from the caller are dropped here as well. Skipped
+# when sourced (BASH_SOURCE != $0), so it never replaces the caller's shell.
+[[ "${BASH_SOURCE[0]}" != "$0" || $- == *p* ]] || exec /usr/bin/env -S bash -p -- "$0" "$@"
 # uninstall.sh - Safe uninstaller for oma-server on Omarchy Linux systems.
 # Restores HOST_LAPTOP baseline before removing runtime artifacts, hooks, and bar widget.
 set -euo pipefail
@@ -44,6 +49,76 @@ else
     ui_log_info() { printf "[ INFO ] %s\n" "$1"; }
     ui_log_ok()   { printf "[ OK ] %s\n" "$1"; }
     ui_log_warn() { printf "[ WARN ] %s\n" "$1" >&2; }
+fi
+
+# 0. Deep Server Mode guard: never uninstall underneath an active deep session, and
+#    remove the opt-in root helper + sudoers rule before the CLI that removes them.
+DEEP_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/oma-server/deep.json"
+DEEP_ROOT_PREFIX="${OMA_SERVER_TEST_ROOT:-}"
+# OMA_SERVER_TEST_ROOT is test-only (same guard as lib/deep.sh).
+if [[ -n "$DEEP_ROOT_PREFIX" ]]; then
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] || { echo "OMA_SERVER_TEST_ROOT is test-only (set OMA_SERVER_TEST_MODE=1)" >&2; exit 2; }
+    [[ "$(id -u)" -ne 0 ]] || { echo "OMA_SERVER_TEST_ROOT refused as root" >&2; exit 2; }
+    [[ "$DEEP_ROOT_PREFIX" == /* && -d "$DEEP_ROOT_PREFIX" \
+       && "$(realpath -e -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$DEEP_ROOT_PREFIX" \
+       && "$(stat -c %u -- "$DEEP_ROOT_PREFIX" 2>/dev/null)" == "$(id -u)" ]] || {
+        echo "OMA_SERVER_TEST_ROOT must be a real, user-owned absolute dir" >&2; exit 2; }
+    for b in sudo pkexec; do
+        t=$(type -t "$b" 2>/dev/null || true)
+        [[ -z "$t" ]] && continue
+        [[ "$t" == file ]] || { echo "OMA_SERVER_TEST_ROOT refused: $b is a $t" >&2; exit 2; }
+        r=$(realpath -e -- "$(type -P "$b")" 2>/dev/null) || { echo "OMA_SERVER_TEST_ROOT refused: $b unresolvable" >&2; exit 2; }
+        if [[ -u "$r" || -g "$r" || "$(stat -c %u -- "$r" 2>/dev/null)" == 0 ]]; then
+            echo "OMA_SERVER_TEST_ROOT refused: real $b reachable ($r)" >&2; exit 2
+        fi
+    done
+fi
+# Never let an inherited shell function (BASH_FUNC_sudo%%) stand in for sudo/pkexec.
+unset -f sudo pkexec 2>/dev/null || true
+DEEP_HELPER_PATH="${DEEP_ROOT_PREFIX}/usr/local/lib/oma-server/deep-helper"
+DEEP_HELPER_DIR="${DEEP_HELPER_PATH%/*}"
+# /etc/sudoers.d is root-only (0750), so the rule itself cannot be seen. Detect the
+# install by the helper/dir or by the grant showing up in 'sudo -n -l -l'.
+# 'sudo -n -l' (no command) also lists an orphaned rule whose helper is gone.
+DEEP_SUDOERS_PATH="${DEEP_ROOT_PREFIX}/etc/sudoers.d/oma-server-deep"
+deep_installed="false"
+deep_rule_unknown="false"
+if [[ -e "$DEEP_HELPER_PATH" || -d "$DEEP_HELPER_DIR" ]]; then
+    deep_installed="true"
+elif command -v sudo >/dev/null 2>&1; then
+    if sudo -n -l -l "$DEEP_HELPER_PATH" check 2>/dev/null | grep -q '!authenticate'; then
+        deep_installed="true"
+    elif sudo_list=$(sudo -n -l 2>/dev/null); then
+        if printf "%s\n" "$sudo_list" | grep -qF -- "$DEEP_HELPER_PATH"; then
+            deep_installed="true"
+        fi
+    else
+        deep_rule_unknown="true"
+    fi
+fi
+if [[ -f "$DEEP_STATE_FILE" ]]; then
+    printf "[ FAIL ] Deep Server Mode is active (%s). Run 'oma-server disable' first; nothing was removed.\n" "$DEEP_STATE_FILE" >&2
+    exit 1
+fi
+if [[ "$deep_installed" == "true" ]]; then
+    deep_cli=""
+    for cand in "$TARGET_DIR/bin/oma-server" "$SCRIPT_DIR/bin/oma-server"; do
+        [[ -x "$cand" ]] && { deep_cli="$cand"; break; }
+    done
+    if [[ ! -t 0 || -z "$deep_cli" ]]; then
+        printf "[ FAIL ] The Deep Server Mode root helper/sudoers rule is installed and removing it needs sudo in a terminal.\n" >&2
+        printf "         Run 'oma-server deep-setup --remove' (e.g. via 'ssh -t'), then re-run ./uninstall.sh. Nothing was removed.\n" >&2
+        exit 1
+    fi
+    if ! "$deep_cli" deep-setup --remove; then
+        printf "[ FAIL ] Could not remove the Deep Server Mode helper; nothing else was removed.\n" >&2
+        exit 1
+    fi
+fi
+
+if [[ "$deep_installed" != "true" && "$deep_rule_unknown" == "true" ]]; then
+    printf "[ WARN ] Could not check for a leftover Deep Server Mode sudoers rule without a password.\n" >&2
+    printf "         If you ever ran 'oma-server deep-setup', remove it with: sudo rm -f %s\n" "$DEEP_SUDOERS_PATH" >&2
 fi
 
 # Decide config.toml fate up front, before anything is removed.
@@ -98,6 +173,38 @@ fi
 
 # 5. Remove CLI symlinks, post-boot hook, and runtime directory
 ui_log_info "Removing CLI symlinks from: $BIN_DIR"
+# Remove the opt-in deep console block (`oma-server deep-shell`) from login profiles.
+# An interrupted rewrite never leaves its temp file behind.
+UNINSTALL_TMP=""
+UNINSTALL_SAVED_TRAPS=$(trap -p INT TERM HUP)
+for sig in INT TERM HUP; do
+    # shellcheck disable=SC2064  # expand $sig now; $UNINSTALL_TMP at signal time
+    trap "[[ -n \"\$UNINSTALL_TMP\" ]] && rm -f -- \"\$UNINSTALL_TMP\"; trap - $sig; kill -s $sig \$\$" "$sig"
+done
+for prof in "$HOME/.bash_profile" "${ZDOTDIR:-$HOME}/.zprofile"; do
+    [[ -f "$prof" && ! -L "$prof" ]] || continue
+    grep -qF "# >>> oma-server deep shell >>>" "$prof" || continue
+    # L2: rewrite only when every begin marker is followed by its end marker; a
+    # hand-edited, unterminated block would otherwise truncate the profile to EOF.
+    if ! awk '$0=="# >>> oma-server deep shell >>>"{if(o)bad=1;o=1;n++;next} $0=="# <<< oma-server deep shell <<<"{if(!o)bad=1;o=0;next} END{exit (bad||o||n==0)?1:0}' "$prof"; then
+        ui_log_warn "$prof has an oma-server deep shell block without a matching end marker; left it untouched. Remove it by hand."
+        continue
+    fi
+    tmp=$(mktemp "${prof}.XXXXXX")
+    UNINSTALL_TMP="$tmp"
+    if awk '$0=="# >>> oma-server deep shell >>>"{h=0;s=1;next} $0=="# <<< oma-server deep shell <<<"{s=0;next} s{next} h{print "";h=0} $0==""{h=1;next} {print} END{if(h)print ""}' "$prof" > "$tmp"; then
+        chmod --reference="$prof" "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$prof" || rm -f "$tmp"
+        UNINSTALL_TMP=""
+    else
+        rm -f "$tmp"
+        UNINSTALL_TMP=""
+        continue
+    fi
+    ui_log_info "Removed the deep console block from $prof"
+done
+trap - INT TERM HUP
+[[ -n "$UNINSTALL_SAVED_TRAPS" ]] && eval "$UNINSTALL_SAVED_TRAPS"
 rm -f "$BIN_DIR/oma-server" "$BIN_DIR/omarchy-server-mode"
 
 if [[ -f "$HOOK_FILE" ]]; then
