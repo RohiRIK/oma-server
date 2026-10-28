@@ -84,7 +84,9 @@ deep_sudoers_expected() {
 # S3: a path must be root-owned (test mode: the user) and not group/other-writable.
 _deep_path_safe() {
     local path="$1" want_uid=0 mode
-    [[ -n "$DEEP_ROOT_PREFIX" ]] && want_uid="$(id -u)"
+    if { [[ -n "$DEEP_ROOT_PREFIX" ]]; }; then
+        want_uid="$(id -u)"
+    fi
     [[ -e "$path" && ! -L "$path" ]] || return 1
     [[ "$(stat -c %u -- "$path" 2>/dev/null)" == "$want_uid" ]] || return 1
     mode=$(stat -c %a -- "$path" 2>/dev/null) || return 1
@@ -340,7 +342,9 @@ _deep_proc_is_omarchy_helper() {
     local -a dirs=(/usr/share/omarchy/ /usr/local/bin/omarchy- /usr/bin/omarchy-
                    /usr/local/lib/try-omarchy/ /usr/local/bin/host-window
                    "${HOME:-/nonexistent}/.local/share/omarchy/" "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/omarchy/")
-    [[ -n "${OMARCHY_PATH:-}" ]] && dirs+=("${OMARCHY_PATH%/}/")
+    if [[ -n "${OMARCHY_PATH:-}" ]]; then
+        dirs+=("${OMARCHY_PATH%/}/")
+    fi
     {
         while IFS= read -r -d '' arg && (( i < 2 )); do
             for dir in "${dirs[@]}"; do
@@ -514,7 +518,9 @@ deep_enter_transaction() {
         (( timeout_sec == 0 )) && ui_log_warn "No --timeout: nothing will bring the desktop back on its own." \
             "Ways back: SSH 'oma-server disable'; Ctrl+Alt+F2 at the machine; reboot; or '${DEEP_PANIC_HINT}'."
         printf "%s Type 'yes' to close these windows and enter DEEP_SERVER: " "$(ui_badge_warn)"
-        read -r answer || answer=""
+        if ! { read -r answer; }; then
+            answer=""
+        fi
         if [[ "$answer" != "yes" ]]; then
             ui_log_info "Not confirmed (expected the word 'yes'). Nothing was changed."
             return 3
@@ -546,7 +552,9 @@ deep_enter_transaction() {
 
     local closed_json timeout_epoch="null"
     closed_json=$(printf "%s" "$clients" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {class: .[0], title: .[1], pid: .[2]})')
-    (( timeout_sec > 0 )) && timeout_epoch=$(( $(date +%s) + timeout_sec ))
+    if { (( timeout_sec > 0 )); }; then
+        timeout_epoch=$(( $(date +%s) + timeout_sec ))
+    fi
 
     deep_state_dir_ensure || return 1
     : > "$DEEP_LOG_FILE"
@@ -586,9 +594,13 @@ deep_transition_setenv() {
     local var
     local -a fwd=(HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY OMARCHY_PATH XDG_STATE_HOME XDG_CONFIG_HOME OMA_DEEP_POLL_INTERVAL)
     # The test-only prefix is forwarded only in test mode (S1).
-    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)
+    if [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]]; then
+        fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)
+    fi
     for var in "${fwd[@]}"; do
-        [[ -n "${!var:-}" ]] && DEEP_SETENV+=("--setenv=${var}=${!var}")
+        if [[ -n "${!var:-}" ]]; then
+            DEEP_SETENV+=("--setenv=${var}=${!var}")
+        fi
     done
     return 0
 }
@@ -598,9 +610,13 @@ deep_transition_setenv() {
 deep_follow_seconds() {
     local config_file="$1" job_wait exit_wait
     job_wait=$(config_get_scalar "$config_file" "deep" "job_wait_seconds" "180")
-    [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )) || job_wait=180
+    if ! { [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )); }; then
+        job_wait=180
+    fi
     exit_wait=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
-    [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )) || exit_wait=45
+    if ! { [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )); }; then
+        exit_wait=45
+    fi
     echo $(( job_wait + exit_wait + 60 ))
 }
 
@@ -609,7 +625,9 @@ deep_follow_enter() {
     local config_file="${1:-}"
     local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}"
     # INFO-5: never feed an unvalidated env value into arithmetic.
-    [[ "$follow_max" =~ ^[0-9]+$ ]] || follow_max=$(deep_follow_seconds "$config_file")
+    if ! { [[ "$follow_max" =~ ^[0-9]+$ ]]; }; then
+        follow_max=$(deep_follow_seconds "$config_file")
+    fi
     local deadline=$(( $(date +%s) + follow_max ))
     local printed=0 total line state
     _deep_follow_print() {
@@ -816,13 +834,17 @@ deep_enter_worker() {
         # jobs; [deep] job_wait_seconds, 0..600), then retry once.
         local job_wait queued=""
         job_wait=$(config_get_scalar "$config_file" "deep" "job_wait_seconds" "180")
-        [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )) || job_wait=180
+        if ! { [[ "$job_wait" =~ ^[0-9]+$ ]] && (( job_wait <= 600 )); }; then
+            job_wait=180
+        fi
         deep_log "uwsm stop refused ($(printf "%s" "$uwsm_out" | grep -o 'TransactionIsDestructive' | head -n 1 || true)); waiting up to ${job_wait}s for queued user jobs, then retrying once"
         if ! deep_wait_until "$job_wait" _deep_no_user_jobs; then
             queued=$(_deep_queued_units)
             deep_log "user jobs still queued after ${job_wait}s: ${queued:-?}"
         fi
-        uwsm stop >/dev/null 2>&1 && uwsm_ok="true"
+        if { uwsm stop >/dev/null 2>&1; }; then
+            uwsm_ok="true"
+        fi
     fi
     if [[ "$uwsm_ok" != "true" ]] || ! deep_wait_until 15 _deep_session_down; then
         if deep_session_active; then
@@ -899,7 +921,9 @@ deep_exit_transaction() {
             local follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}" ew
             if ! [[ "$follow_max" =~ ^[0-9]+$ ]]; then
                 ew=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
-                [[ "$ew" =~ ^[0-9]+$ ]] && (( ew >= 1 && ew <= 600 )) || ew=45
+                if ! { [[ "$ew" =~ ^[0-9]+$ ]] && (( ew >= 1 && ew <= 600 )); }; then
+                    ew=45
+                fi
                 follow_max=$(( 2 * ew + 60 ))
             fi
             ui_log_info "A desktop restore is already in progress; waiting up to ${follow_max}s for it to finish."
@@ -921,7 +945,9 @@ deep_exit_transaction() {
 
     local wait_s
     wait_s=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
-    [[ "$wait_s" =~ ^[0-9]+$ ]] && (( wait_s >= 1 && wait_s <= 600 )) || wait_s=45
+    if ! { [[ "$wait_s" =~ ^[0-9]+$ ]] && (( wait_s >= 1 && wait_s <= 600 )); }; then
+        wait_s=45
+    fi
 
     local from_state; from_state=$(deep_state_get state "DEEP_SERVER")
     deep_state_set state '"DEEP_EXITING"'
@@ -949,7 +975,9 @@ deep_exit_transaction() {
         # A running greeter (stop_display_manager = false, or a failed earlier exit) only
         # autologins again on a fresh start, so restart it; otherwise start it.
         local dm_verb="dm-start"
-        deep_dm_active && dm_verb="dm-restart"
+        if { deep_dm_active; }; then
+            dm_verb="dm-restart"
+        fi
         if deep_helper_root "$dm_verb" >/dev/null; then
             deep_log "exit: display-manager ${dm_verb#dm-}ed, waiting up to ${wait_s}s for Hyprland"
             if ! deep_has_autologin && deep_wait_until 5 deep_dm_active; then
@@ -1016,7 +1044,9 @@ deep_on_console() {
     local fd t console="/dev/tty1"
     # Test mode only: the sandbox runs on a pty, so let tests name the console.
     # INFO-11: only with the guarded test root (deep_guard_test_root), never TEST_MODE alone.
-    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && -n "${OMA_DEEP_TEST_CONSOLE:-}" ]] && console="$OMA_DEEP_TEST_CONSOLE"
+    if { [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && -n "${OMA_DEEP_TEST_CONSOLE:-}" ]]; }; then
+        console="$OMA_DEEP_TEST_CONSOLE"
+    fi
     for fd in 0 1 2; do
         [[ -t "$fd" ]] || continue
         # INFO-9: read the fd's target from /proc; `tty` inside $() would see the
@@ -1071,7 +1101,9 @@ deep_follow_exit() {
     follow_max="${OMA_DEEP_FOLLOW_SECONDS:-}"
     if ! [[ "$follow_max" =~ ^[0-9]+$ ]]; then
         exit_wait=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
-        [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )) || exit_wait=45
+        if ! { [[ "$exit_wait" =~ ^[0-9]+$ ]] && (( exit_wait >= 1 && exit_wait <= 600 )); }; then
+            exit_wait=45
+        fi
         follow_max=$(( 2 * exit_wait + 60 ))
     fi
     local deadline=$(( $(date +%s) + follow_max ))
@@ -1204,7 +1236,9 @@ deep_setup() {
     ui_log_warn "Any process running as a wheel user can then stop/start the desktop without a password (local DoS, no privilege escalation)."
     printf "%s Install the Deep Server Mode helper and sudoers rule? [y/N]: " "$(ui_badge_info)"
     local answer=""
-    read -r answer || answer=""
+    if ! { read -r answer; }; then
+        answer=""
+    fi
     if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" ]]; then
         ui_log_info "Cancelled. Nothing was installed."
         return 1
@@ -1335,9 +1369,15 @@ deep_render_plan() {
     local config_file="$1"
     local allowed grant="missing" ssh_state="inactive" linger
     allowed="$(config_get_bool "$config_file" "deep" "allowed" "false")"
-    deep_helper_installed && deep_grant_ok && grant="ok (passwordless, fixed verbs)"
-    deep_helper_present && ! deep_helper_current && grant="OUTDATED helper: run 'oma-server deep-setup'"
-    systemctl is-active --quiet sshd.service 2>/dev/null && ssh_state="active"
+    if { deep_helper_installed && deep_grant_ok; }; then
+        grant="ok (passwordless, fixed verbs)"
+    fi
+    if { deep_helper_present && ! deep_helper_current; }; then
+        grant="OUTDATED helper: run 'oma-server deep-setup'"
+    fi
+    if { systemctl is-active --quiet sshd.service 2>/dev/null; }; then
+        ssh_state="active"
+    fi
     linger=$(loginctl show-user "${USER:-$(id -un)}" -p Linger --value 2>/dev/null || echo "unknown")
 
     echo ""
@@ -1413,7 +1453,9 @@ DEEP_TMP_SAVED_TRAPS=""
 # deep_tmp_guard <tmp>: register a temp file and arm INT/TERM/HUP cleanup. Any
 # earlier INT/TERM/HUP traps are saved (trap -p) and put back by deep_tmp_release.
 deep_tmp_guard() {
-    (( ${#DEEP_TMP_FILES[@]} == 0 )) && DEEP_TMP_SAVED_TRAPS=$(trap -p INT TERM HUP)
+    if { (( ${#DEEP_TMP_FILES[@]} == 0 )); }; then
+        DEEP_TMP_SAVED_TRAPS=$(trap -p INT TERM HUP)
+    fi
     DEEP_TMP_FILES+=("$1")
     trap '_deep_tmp_on_signal INT' INT
     trap '_deep_tmp_on_signal TERM' TERM
@@ -1555,9 +1597,15 @@ deep_shell_cmd() {
         local c b mark
         for c in "${DEEP_SHELL_CHOICES[@]}"; do
             b=$(deep_shell_binary "$c"); mark="installed"
-            [[ -n "$b" ]] && ! command -v "$b" >/dev/null 2>&1 && mark="not installed"
-            [[ "$c" == none ]] && mark="plain console + login: prompt (default)"
-            [[ "$c" == custom ]] && mark="[deep] shell_command"
+            if { [[ -n "$b" ]] && ! command -v "$b" >/dev/null 2>&1; }; then
+                mark="not installed"
+            fi
+            if { [[ "$c" == none ]]; }; then
+                mark="plain console + login: prompt (default)"
+            fi
+            if { [[ "$c" == custom ]]; }; then
+                mark="[deep] shell_command"
+            fi
             printf '  %s %-7s %s\n' "$([[ $c == "$current" ]] && echo '*' || echo ' ')" "$c" "$mark"
         done
         return 0
@@ -1590,7 +1638,10 @@ deep_shell_cmd() {
     # INFO-10: remember the old command so a failed `shell` write never leaves a new
     # shell_command live (when the current choice is already custom) while we report failure.
     local old_cmd; old_cmd=$(config_get_scalar "$config_file" "deep" "shell_command" "")
-    local had_cmd=0; deep_config_has_key "$config_file" "shell_command" && had_cmd=1
+    local had_cmd=0
+    if deep_config_has_key "$config_file" "shell_command"; then
+        had_cmd=1
+    fi
     local cmd_written=0 cfg_ok=1
     if [[ "$choice" == custom ]]; then
         if deep_config_set_string "$config_file" "shell_command" "$2"; then cmd_written=1; else cfg_ok=0; fi
@@ -1602,10 +1653,14 @@ deep_shell_cmd() {
         local restored=1
         if (( cmd_written )); then
             if (( had_cmd )); then
-                deep_config_set_string "$config_file" "shell_command" "$old_cmd" || restored=0
+                if ! { deep_config_set_string "$config_file" "shell_command" "$old_cmd"; }; then
+                    restored=0
+                fi
             else
                 # No key before: drop it rather than leave shell_command = "".
-                deep_config_unset_key "$config_file" "shell_command" || restored=0
+                if ! { deep_config_unset_key "$config_file" "shell_command"; }; then
+                    restored=0
+                fi
             fi
         fi
         if (( ! restored )); then

@@ -1074,7 +1074,7 @@ echo "oma-server $*" >> "{self.log}"
 
     def test_s1_worker_env_forwarding_gated_on_test_mode(self):
         src = (ROOT / "lib/deep.sh").read_text()
-        self.assertIn('[[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]] && fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)', src)
+        self.assertIn('    if [[ "${OMA_SERVER_TEST_MODE:-}" == 1 ]]; then\n        fwd+=(OMA_SERVER_TEST_MODE OMA_SERVER_TEST_ROOT)\n    fi', src)
         base = src.split("local -a fwd=(", 1)[1].split(")", 1)[0]
         self.assertNotIn("OMA_SERVER_TEST_ROOT", base)
 
@@ -1451,7 +1451,7 @@ class FollowUpFixTests3(DeepSandbox):
         src = (ROOT / "lib/deep.sh").read_text()
         self.assertIn('deep_follow_enter "$config_file"', src)
         # INFO-5: the env override is validated, then falls back to the computed deadline.
-        self.assertIn('[[ "$follow_max" =~ ^[0-9]+$ ]] || follow_max=$(deep_follow_seconds "$config_file")', src)
+        self.assertIn('if ! { [[ "$follow_max" =~ ^[0-9]+$ ]]; }; then\n        follow_max=$(deep_follow_seconds "$config_file")\n    fi', src)
 
     # ---- N4: status flags allowed-but-missing helper ----
     def test_n4_status_degraded_when_allowed_but_helper_missing(self):
@@ -2643,6 +2643,32 @@ exec /usr/bin/awk "$@"
 
     def test_readme_tuios_is_modal(self):
         self.assertIn("press `i` to start typing", (ROOT / "README.md").read_text())
+
+
+class MarketplaceScanLimitTests(unittest.TestCase):
+    """The marketplace security baseline doubles its static shell-state count for every
+    one-line conditional assignment (`cond && var=x`, `cond || var=default`) and aborts
+    above 64 states. lib/deep.sh is in scope (it references sudoers), so keep it at zero."""
+
+    ONE_LINE_ASSIGN = re.compile(r"(&&|\|\|)\s+[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+
+    def test_deep_sh_has_no_one_line_conditional_assignments(self):
+        hits = [f"{i}: {l.strip()}" for i, l in enumerate((ROOT / "lib/deep.sh").read_text().splitlines(), 1)
+                if not l.lstrip().startswith("#") and self.ONE_LINE_ASSIGN.search(l)]
+        self.assertEqual(hits, [], "rewrite these as if-blocks (marketplace scan-limit)")
+
+    def test_rewritten_defaults_still_apply(self):
+        # Behaviour spot-check of rewritten validators: bad values fall back to defaults.
+        script = f"""
+source "{ROOT}/lib/config.sh"; source "{ROOT}/lib/deep.sh"
+cfg=$(mktemp); printf '[deep]\\njob_wait_seconds = 9999\\nexit_wait_seconds = abc\\n' > "$cfg"
+deep_follow_seconds "$cfg"; echo
+printf '[deep]\\njob_wait_seconds = 10\\nexit_wait_seconds = 5\\n' > "$cfg"
+deep_follow_seconds "$cfg"; echo
+rm -f "$cfg"
+"""
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.stdout.split(), ["285", "75"], res.stderr)
 
 
 if __name__ == "__main__":
