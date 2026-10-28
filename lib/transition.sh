@@ -37,10 +37,11 @@ verify_pid_identity() {
 get_quickshell_telemetry() {
     local current_uid="${UID:-$(id -u)}"
     local qs_pid=""
-    qs_pid=$(pgrep -u "$current_uid" -x "omarchy-shell" 2>/dev/null | head -n 1 || true)
-    if [[ -z "$qs_pid" ]]; then
-        qs_pid=$(pgrep -u "$current_uid" -x "quickshell" 2>/dev/null | head -n 1 || true)
-    fi
+    # The bar is the long-lived `quickshell -n -p $OMARCHY_PATH/shell` process
+    # (omarchy-launch-shell). `omarchy-shell` is only Omarchy's short-lived IPC wrapper
+    # script (e.g. `omarchy-shell shell ping`), never the shell itself, so it is not
+    # matched; -o picks the oldest quickshell if several exist.
+    qs_pid=$(pgrep -o -u "$current_uid" -x "quickshell" 2>/dev/null || true)
 
     if [[ -z "$qs_pid" ]] || [[ ! -r "/proc/$qs_pid/status" ]]; then
         printf "Inactive"
@@ -248,7 +249,7 @@ freeze_quickshell() {
         was_running=$(jq -r '.quickshell_state.was_running' "$snapshot_file" 2>/dev/null || echo "false")
     fi
 
-    if [[ "$was_running" == "true" ]] && verify_pid_identity "$qs_pid" "quickshell|omarchy-shell"; then
+    if [[ "$was_running" == "true" ]] && verify_pid_identity "$qs_pid" "quickshell"; then
         # Notify the bar widget to display the Homelab icon (◆) and close any open popup
         # before Quickshell's event loop is frozen with SIGSTOP.
         if command -v omarchy-shell >/dev/null 2>&1; then
@@ -269,19 +270,17 @@ resume_quickshell() {
         qs_pid=$(jq -r '.quickshell_state.pid' "$snapshot_file" 2>/dev/null || echo "null")
     fi
 
-    if verify_pid_identity "$qs_pid" "quickshell|omarchy-shell"; then
+    if verify_pid_identity "$qs_pid" "quickshell"; then
         kill -CONT "$qs_pid" 2>/dev/null || true
         return 0
     fi
 
     # Fallback discovery scoped to UID
     local fallback_pid=""
-    for proc_name in "omarchy-shell" "quickshell"; do
-        fallback_pid=$(pgrep -u "$current_uid" -x "$proc_name" 2>/dev/null | head -n 1 || true)
-        if verify_pid_identity "$fallback_pid" "quickshell|omarchy-shell"; then
-            kill -CONT "$fallback_pid" 2>/dev/null || true
-        fi
-    done
+    fallback_pid=$(pgrep -o -u "$current_uid" -x "quickshell" 2>/dev/null || true)
+    if verify_pid_identity "$fallback_pid" "quickshell"; then
+        kill -CONT "$fallback_pid" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -708,6 +707,7 @@ force_rescue_mode() {
     _rescue_unfreeze() {
         resume_quickshell "$snapshot_file"
         pkill -CONT -u "$current_uid" -x "quickshell" 2>/dev/null || true
+        # Also thaw the omarchy-shell wrapper: older builds could SIGSTOP it by mistake.
         pkill -CONT -u "$current_uid" -x "omarchy-shell" 2>/dev/null || true
     }
     ui_run_step 1 "$total_steps" "Unfreezing all Quickshell processes (SIGCONT)" \

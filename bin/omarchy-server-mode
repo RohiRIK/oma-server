@@ -365,7 +365,8 @@ case "$cmd" in
         deep_helper_hint=""
         if [[ "$deep_allowed" == "true" ]] && ! deep_helper_installed; then
             deep_helper_ok="false"
-            deep_helper_hint="deep helper missing; run '$CMD_NAME deep-setup' or '$CMD_NAME deep-setup --remove'"
+            # M-new-1: a stale helper (hash differs from the pin) is reported, not trusted.
+            deep_helper_hint="$(deep_helper_problem); run '$CMD_NAME deep-setup' or '$CMD_NAME deep-setup --remove'"
         fi
         if [[ "$as_json" == "true" ]]; then
             if deep_state_exists; then
@@ -387,7 +388,7 @@ case "$cmd" in
         fi
         if [[ "$deep_helper_ok" != "true" ]]; then
             ui_log_warn "Health      : DEGRADED, ${deep_helper_hint}." \
-                "[deep] allowed = true, but $DEEP_HELPER_PATH is missing or unsafe, so 'enable --deep' refuses."
+                "[deep] allowed = true, but $DEEP_HELPER_PATH is missing, unsafe or outdated, so 'enable --deep' refuses."
         fi
         exit 0
         ;;

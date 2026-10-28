@@ -176,6 +176,7 @@ ui_log_info "Removing CLI symlinks from: $BIN_DIR"
 # Remove the opt-in deep console block (`oma-server deep-shell`) from login profiles.
 # An interrupted rewrite never leaves its temp file behind.
 UNINSTALL_TMP=""
+UNINSTALL_SAVED_TRAPS=$(trap -p INT TERM HUP)
 for sig in INT TERM HUP; do
     # shellcheck disable=SC2064  # expand $sig now; $UNINSTALL_TMP at signal time
     trap "[[ -n \"\$UNINSTALL_TMP\" ]] && rm -f -- \"\$UNINSTALL_TMP\"; trap - $sig; kill -s $sig \$\$" "$sig"
@@ -203,6 +204,7 @@ for prof in "$HOME/.bash_profile" "${ZDOTDIR:-$HOME}/.zprofile"; do
     ui_log_info "Removed the deep console block from $prof"
 done
 trap - INT TERM HUP
+[[ -n "$UNINSTALL_SAVED_TRAPS" ]] && eval "$UNINSTALL_SAVED_TRAPS"
 rm -f "$BIN_DIR/oma-server" "$BIN_DIR/omarchy-server-mode"
 
 if [[ -f "$HOOK_FILE" ]]; then

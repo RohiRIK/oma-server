@@ -192,7 +192,8 @@ deep_available_mb() {
 # -----------------------------------------------------------------------------
 # The sudoers file is NOT checked here: /etc/sudoers.d is 0750 root on Arch, so a
 # user cannot see it. The grant itself is checked by deep_grant_ok (sudo -n -l -l).
-deep_helper_installed() {
+# Present and safely owned (any version).
+deep_helper_present() {
     [[ -f "$DEEP_HELPER_PATH" && ! -L "$DEEP_HELPER_PATH" && -x "$DEEP_HELPER_PATH" ]] || return 1
     _deep_path_safe "$DEEP_HELPER_PATH" || return 1
     _deep_path_safe "$DEEP_HELPER_DIR" || return 1
@@ -200,6 +201,29 @@ deep_helper_installed() {
     _deep_path_safe "${DEEP_HELPER_DIR%/*}" || return 1
     _deep_path_safe "${DEEP_ROOT_PREFIX}/usr/local" || return 1
     return 0
+}
+
+# The installed copy is the helper this version pins (DEEP_HELPER_SHA256). A stale
+# helper from an earlier build lacks later fixes (e.g. the tty1 console), so it does
+# not count as installed until 'oma-server deep-setup' replaces it.
+deep_helper_current() {
+    local sha
+    sha=$(sha256sum -- "$DEEP_HELPER_PATH" 2>/dev/null | awk '{print $1}') || return 1
+    [[ "$sha" == "$DEEP_HELPER_SHA256" ]]
+}
+
+# Present, safe and current.
+deep_helper_installed() {
+    deep_helper_present && deep_helper_current
+}
+
+# Prints "" when the helper is fine, else a short reason for status/plan/preflight.
+deep_helper_problem() {
+    if ! deep_helper_present; then
+        printf 'deep helper missing'
+    elif ! deep_helper_current; then
+        printf 'deep helper outdated (sha256 does not match this version)'
+    fi
 }
 
 # True when anything of the deep-mode root footprint is visible to the user.
@@ -401,6 +425,11 @@ deep_preflight() {
 
     if [[ "$(config_get_bool "$config_file" "deep" "allowed" "false")" != "true" ]]; then
         ui_log_fail "Deep Server Mode is not set up ([deep] allowed = false)." "Run 'oma-server deep-setup' first."
+        return 1
+    fi
+    if deep_helper_present && ! deep_helper_current; then
+        ui_log_fail "The installed deep-mode root helper is outdated (its sha256 does not match this version)." \
+            "Run 'oma-server deep-setup' to update it."
         return 1
     fi
     if ! deep_helper_installed || ! deep_grant_ok; then
@@ -855,6 +884,9 @@ deep_exit_transaction() {
         ui_log_fail "Another deep-mode transition holds $DEEP_LOCK_FILE." "Wait and retry 'oma-server disable'."
         return 1
     fi
+    # L3: a concurrent exit may have finished while we waited for the lock; never
+    # restart the desktop it just brought back.
+    deep_state_exists || { exec 201>&-; ui_log_info "Already restored to HOST_LAPTOP."; return 0; }
 
     local wait_s
     wait_s=$(config_get_scalar "$config_file" "deep" "exit_wait_seconds" "45")
@@ -950,11 +982,15 @@ deep_exit_transaction() {
 # would SIGHUP a foreground exit sequence between "stop getty" and "start DM".
 deep_on_console() {
     [[ -n "${OMA_DEEP_SHELL_ACTIVE:-}" ]] && return 0
-    local fd t
+    local fd t console="/dev/tty1"
+    # Test mode only: the sandbox runs on a pty, so let tests name the console.
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "${OMA_DEEP_TEST_CONSOLE:-}" ]] && console="$OMA_DEEP_TEST_CONSOLE"
     for fd in 0 1 2; do
         [[ -t "$fd" ]] || continue
-        t=$(tty <&"$fd" 2>/dev/null) || continue
-        [[ "$t" == /dev/tty1 ]] && return 0
+        # INFO-9: read the fd's target from /proc; `tty` inside $() would see the
+        # capture pipe on fd 1.
+        t=$(readlink -- "/proc/$$/fd/$fd" 2>/dev/null) || continue
+        [[ "$t" == "$console" ]] && return 0
     done
     return 1
 }
@@ -971,6 +1007,13 @@ deep_exit_unit_running() {
 # the foreground. Same return codes as deep_exit_transaction.
 deep_exit_run() {
     local config_file="$1" is_auto="${2:-false}" self_bin="$3"
+    # L3: an exit worker is already running (tty1 disable, then SSH disable): follow it
+    # instead of starting a second exit that could restart the restored desktop.
+    if [[ "$is_auto" != "true" ]] && deep_exit_unit_running; then
+        ui_log_info "A desktop restore is already running (${DEEP_EXIT_UNIT}); following it."
+        deep_follow_exit "$config_file"
+        return
+    fi
     if [[ "$is_auto" == "true" ]] || ! deep_on_console; then
         deep_exit_transaction "$config_file" "$is_auto"
         return
@@ -1261,6 +1304,7 @@ deep_render_plan() {
     local allowed grant="missing" ssh_state="inactive" linger
     allowed="$(config_get_bool "$config_file" "deep" "allowed" "false")"
     deep_helper_installed && deep_grant_ok && grant="ok (passwordless, fixed verbs)"
+    deep_helper_present && ! deep_helper_current && grant="OUTDATED helper: run 'oma-server deep-setup'"
     systemctl is-active --quiet sshd.service 2>/dev/null && ssh_state="active"
     linger=$(loginctl show-user "${USER:-$(id -un)}" -p Linger --value 2>/dev/null || echo "unknown")
 
@@ -1308,6 +1352,17 @@ deep_shell_profile_file() {
     esac
 }
 
+# First program word of a custom command (skips leading VAR=value assignments).
+deep_custom_program() {
+    local w words=()
+    read -ra words <<< "$1"
+    for w in "${words[@]}"; do
+        [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+        printf '%s' "$w"; return 0
+    done
+    return 1
+}
+
 deep_shell_binary() {
     case "$1" in
         none) printf '' ;; custom) printf 'bash' ;; *) printf '%s' "$1" ;;
@@ -1322,17 +1377,23 @@ _deep_tmp_on_signal() {
     trap - "$1"
     kill -s "$1" "$$"
 }
-# deep_tmp_guard <tmp>: register a temp file and arm INT/TERM/HUP cleanup.
+DEEP_TMP_SAVED_TRAPS=""
+# deep_tmp_guard <tmp>: register a temp file and arm INT/TERM/HUP cleanup. Any
+# earlier INT/TERM/HUP traps are saved (trap -p) and put back by deep_tmp_release.
 deep_tmp_guard() {
+    (( ${#DEEP_TMP_FILES[@]} == 0 )) && DEEP_TMP_SAVED_TRAPS=$(trap -p INT TERM HUP)
     DEEP_TMP_FILES+=("$1")
     trap '_deep_tmp_on_signal INT' INT
     trap '_deep_tmp_on_signal TERM' TERM
     trap '_deep_tmp_on_signal HUP' HUP
 }
-# deep_tmp_release: forget the temp files and restore default signal handling.
+# deep_tmp_release: forget the temp files and restore the traps saved by deep_tmp_guard.
 deep_tmp_release() {
     DEEP_TMP_FILES=()
     trap - INT TERM HUP
+    [[ -n "$DEEP_TMP_SAVED_TRAPS" ]] && eval "$DEEP_TMP_SAVED_TRAPS"
+    DEEP_TMP_SAVED_TRAPS=""
+    return 0
 }
 
 # L2: true only when every BEGIN marker is followed by its END marker (no nesting,
@@ -1453,19 +1514,31 @@ deep_shell_cmd() {
     if [[ "$choice" == custom ]]; then
         [[ "${1:-}" == "--command" && -n "${2:-}" ]] || { ui_log_fail "custom needs --command \"<cmd>\"."; return 1; }
         [[ "$2" != *'"'* && "$2" != *$'\n'* && "$2" != *\\* ]] || { ui_log_fail "The command may not contain double quotes, backslashes or newlines."; return 1; }
-        deep_config_set_string "$config_file" "shell_command" "$2" || return 1
     fi
-    deep_config_set_string "$config_file" "shell" "$choice" || return 1
 
+    # L-new-1: edit the profile first; the config only changes once that worked, so a
+    # refused profile never leaves the config claiming a shell with no block.
     if [[ "$choice" == none ]]; then
         deep_shell_profile_remove "$prof" || return 1
+        if ! deep_config_set_string "$config_file" "shell" "none"; then
+            [[ "$current" != none && -x "$launcher" ]] && deep_shell_profile_add "$prof" "$launcher" >/dev/null 2>&1
+            ui_log_fail "Could not update [deep] shell in '$config_file'; the profile block was put back."
+            return 1
+        fi
         ui_log_ok "Deep console: plain shell with a login: prompt (profile block removed)."
         return 0
     fi
     [[ -x "$launcher" ]] || { ui_log_fail "Launcher '$launcher' missing; re-run install.sh."; return 1; }
     deep_shell_profile_add "$prof" "$launcher" || return 1
+    if { [[ "$choice" == custom ]] && ! deep_config_set_string "$config_file" "shell_command" "$2"; } ||
+            ! deep_config_set_string "$config_file" "shell" "$choice"; then
+        [[ "$current" == none ]] && deep_shell_profile_remove "$prof" >/dev/null 2>&1
+        ui_log_fail "Could not update [deep] shell in '$config_file'; the profile was rolled back."
+        return 1
+    fi
     local b; b=$(deep_shell_binary "$choice")
-    if ! command -v "$b" >/dev/null 2>&1; then
+    if [[ "$choice" == custom ]]; then b=$(deep_custom_program "$2" || true); fi
+    if [[ -n "$b" ]] && ! command -v "$b" >/dev/null 2>&1; then
         ui_log_warn "'$b' is not installed yet; tty1 will fall back to the plain shell until it is."
     fi
     ui_log_ok "Deep console: log in on tty1, then $choice starts (any key within 3 s skips it; quitting returns to the shell)."

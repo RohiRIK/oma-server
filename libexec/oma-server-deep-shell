@@ -75,6 +75,19 @@ cmd_login() {
         note "[deep] shell = \"$choice\" is not usable; staying in the plain shell."
         return 0
     fi
+    if [[ "$choice" == custom ]]; then
+        # Check the custom command's own program, not bash (skip VAR=value prefixes).
+        local w prog="" words=()
+        read -ra words <<< "${argv[2]}"
+        for w in "${words[@]}"; do
+            [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+            prog="$w"; break
+        done
+        if [[ -n "$prog" ]] && ! command -v "$prog" >/dev/null 2>&1; then
+            note "custom command '$prog' is not installed; staying in the plain shell."
+            return 0
+        fi
+    fi
     if ! command -v "${argv[0]}" >/dev/null 2>&1; then
         note "'${argv[0]}' is not installed; staying in the plain shell."
         return 0
@@ -93,7 +106,9 @@ cmd_login() {
     "${argv[@]}" || rc=$?
     unset OMA_DEEP_SHELL_ACTIVE
     stty sane 2>/dev/null || true
-    printf '\033[0m'; clear 2>/dev/null || true
+    printf '\033[0m'
+    # Clear only after a clean exit; after a failure keep its error message visible.
+    if (( rc == 0 )); then clear 2>/dev/null || true; fi
     if (( rc == 0 )); then
         note "$choice exited. You are in the plain shell (desktop is still off)."
     else

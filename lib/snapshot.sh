@@ -110,10 +110,11 @@ capture_snapshot() {
 
     # Discover omarchy-shell / quickshell PID scoped strictly to current user (${UID})
     local qs_pid="" was_running="false"
-    qs_pid=$(pgrep -u "$current_uid" -x "omarchy-shell" 2>/dev/null | head -n 1 || true)
-    if [[ -z "$qs_pid" ]]; then
-        qs_pid=$(pgrep -u "$current_uid" -x "quickshell" 2>/dev/null | head -n 1 || true)
-    fi
+    # The bar is the long-lived `quickshell -n -p $OMARCHY_PATH/shell` process
+    # (omarchy-launch-shell). `omarchy-shell` is only Omarchy's short-lived IPC wrapper
+    # script (e.g. `omarchy-shell shell ping`), never the shell itself, so it is not
+    # matched; -o picks the oldest quickshell if several exist.
+    qs_pid=$(pgrep -o -u "$current_uid" -x "quickshell" 2>/dev/null || true)
 
     if [[ -n "$qs_pid" && "$qs_pid" =~ ^[0-9]+$ ]] && (( qs_pid > 1 )); then
         was_running="true"

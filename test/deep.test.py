@@ -1826,6 +1826,32 @@ class DeepShellLauncherTests(unittest.TestCase):
             self.assertNotIn("byobu", (ROOT / f).read_text(), f)
 
 
+    # ---- seventh pass (Quill @ 7bc6ec3) ----
+    def stub_clear(self):
+        write_executable(self.stubs / "clear", f'#!/usr/bin/env bash\necho CLEARED >> "{self.log}"\n')
+
+    def test_failure_does_not_clear_screen(self):
+        self.stub_clear()
+        self.write_config("custom", "bash -c 'echo boom-error >&2; exit 3'")
+        res = self.login()
+        self.assertIn("boom-error", res.plain)
+        self.assertIn("ended with code 3", res.plain)
+        self.assertNotIn("CLEARED", self.tui_calls())
+
+    def test_clean_exit_still_clears(self):
+        self.stub_clear()
+        self.stub_tui("btop")
+        self.write_config("btop")
+        self.login()
+        self.assertIn("CLEARED", self.tui_calls())
+
+    def test_missing_custom_program_stays_in_plain_shell(self):
+        self.write_config("custom", "FOO=1 no-such-prog-xyz -d 2")
+        res = self.login()
+        self.assertIn("custom command 'no-such-prog-xyz' is not installed", res.plain)
+        self.assertNotIn("Starting custom", res.plain)
+
+
 class DeepShellCliTests(DeepSandbox):
     """oma-server deep-shell [name]: config + managed login-profile block."""
 
@@ -1990,7 +2016,21 @@ class SixthPassTests(DeepSandbox):
         return self.home / name
 
     def on_tty1(self):
-        write_executable(self.bin / "tty", "#!/usr/bin/env bash\necho /dev/tty1\n")
+        # The sandbox runs on a pty; name that pty as "the console" (test mode only).
+        self._console = True
+
+    def cli_tty(self, *args, answers="", extra_env=None):
+        if not shutil.which("script"):
+            self.skipTest("util-linux 'script' not available")
+        prefix = 'export OMA_DEEP_TEST_CONSOLE="$(tty)"; ' if getattr(self, "_console", False) else ""
+        cmd = prefix + " ".join([str(OMA_BIN), *args]) + "; echo __RC=$?"
+        res = subprocess.run(["script", "-qec", cmd, "/dev/null"], input=answers, capture_output=True,
+                             text=True, env=self.env(extra_env), timeout=60)
+        out = ANSI_RE.sub("", res.stdout + res.stderr)
+        m = re.search(r"__RC=(\d+)", out)
+        res.rc = int(m.group(1)) if m else -1
+        res.plain = out
+        return res
 
     def exit_runs(self):
         return [c for c in self.calls() if c.startswith("systemd-run --user") and "--unit=oma-server-deep-exit" in c]
@@ -2189,6 +2229,269 @@ exec /usr/bin/awk "$@"
                              text=True, env=self.env(), timeout=60)
         self.assertEqual(res.returncode, -signal.SIGTERM, res.stdout + res.stderr)
         self.assertEqual([p.name for p in self.home.iterdir() if p.name.startswith(".bash_profile.")], [])
+
+
+class StaleHelperTests(DeepSandbox):
+    """Quill M-new-1: an installed helper whose sha256 differs from DEEP_HELPER_SHA256 is not trusted."""
+
+    def make_stale(self):
+        self.install_helper()
+        os.chmod(self.helper_path, 0o755)
+        with open(self.helper_path, "a") as fh:
+            fh.write("# older build\n")
+
+    def helper_calls(self):
+        return [c for c in self.calls() if "deep-helper " in c and c.startswith("sudo") and "-l -l" not in c]
+
+    def test_enable_deep_refuses_stale_helper(self):
+        self.make_stale()
+        res = self.cli("enable", "--deep")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("outdated", res.plain)
+        self.assertIn("oma-server deep-setup", res.plain)
+        self.assertIsNone(self.deep_state())
+        self.assertEqual(self.helper_calls(), [])
+        self.assertFalse(any(c.startswith("systemd-run") for c in self.calls()))
+        self.assertTrue(self.is_active("sys", "display-manager.service"))
+
+    def test_status_degraded_with_setup_hint(self):
+        self.make_stale()
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertFalse(st["deep_helper_ok"])
+        self.assertEqual(st["health"], "DEGRADED")
+        self.assertIn("deep helper outdated", st["health_hint"])
+        self.assertIn("deep-setup", st["health_hint"])
+        plain = self.cli("status").plain
+        self.assertIn("DEGRADED", plain)
+        self.assertIn("deep helper outdated", plain)
+
+    def test_diff_deep_shows_outdated(self):
+        self.make_stale()
+        res = self.cli("diff", "--deep")
+        self.assertIn("OUTDATED helper", res.plain)
+        self.assertNotIn("ok (passwordless", res.plain)
+
+    def test_current_helper_is_ok(self):
+        self.install_helper()
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertTrue(st["deep_helper_ok"])
+        self.assertEqual(st["health"], "OK")
+        self.assertIn("ok (passwordless", self.cli("diff", "--deep").plain)
+
+    def test_missing_helper_still_says_missing(self):
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertIn("deep helper missing", st["health_hint"])
+
+    def test_disable_still_works_with_stale_helper(self):
+        self.make_stale()
+        self.write_deep_state()
+        self.enter_desktop_down()
+        res = self.cli("disable")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIsNone(self.deep_state())
+        self.assertTrue(self.is_active("sys", "display-manager.service"))
+
+    def test_readme_matches_behaviour(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn('"deep helper outdated"', readme)
+        self.assertIn("`enable --deep` refuses", readme)
+        self.assertNotIn('"deep helper missing". Re-running', readme)
+
+
+class SeventhPassTests(DeepSandbox):
+    """Sam re-review @ 7bc6ec3 (L3, INFO-9, trap restore) and Quill's 7bc6ec3 VM report."""
+
+    BEGIN = "# >>> oma-server deep shell >>>"
+    END = "# <<< oma-server deep shell <<<"
+
+    def profile(self):
+        return self.home / ".bash_profile"
+
+    def dm_calls(self):
+        return [c for c in self.calls() if "deep-helper dm-" in c and c.startswith("sudo")]
+
+    def ready_to_exit(self):
+        self.install_helper()
+        self.write_deep_state()
+        self.enter_desktop_down()
+
+    def run_on_console_fd1_only(self):
+        """stdout is the console pty; stdin and stderr are not ttys (INFO-9)."""
+        cmd = (f'export OMA_DEEP_TEST_CONSOLE="$(tty)"; {OMA_BIN} disable </dev/null 2>"{self.base}/err.txt";'
+               ' echo __RC=$?')
+        res = subprocess.run(["script", "-qec", cmd, "/dev/null"], input="", capture_output=True, text=True,
+                             env=self.env(), timeout=60)
+        return ANSI_RE.sub("", res.stdout + res.stderr)
+
+    # ---- L3 ----
+    def test_l3_running_exit_unit_is_followed_not_duplicated(self):
+        self.ready_to_exit()
+        self.set_active("user", "oma-server-deep-exit.service")
+        res = self.cli("disable", extra_env={"OMA_DEEP_FOLLOW_SECONDS": "1"})
+        self.assertIn("already running", res.plain)
+        self.assertEqual(res.returncode, 4, res.plain)
+        self.assertEqual(self.dm_calls(), [])
+        self.assertFalse(any(c.startswith("systemd-run") for c in self.calls()))
+
+    def test_l3_running_exit_unit_success_when_state_cleared(self):
+        self.ready_to_exit()
+        self.set_active("user", "oma-server-deep-exit.service")
+        (self.deep_dir / "deep.json").unlink()
+        (self.deep_dir / "last-deep.json").write_text('{"result":"exited"}')
+        self.write_deep_state()
+        # state disappears while following
+        import threading, time
+        def clear():
+            time.sleep(0.5)
+            (self.deep_dir / "deep.json").unlink()
+        th = threading.Thread(target=clear); th.start()
+        res = self.cli("disable", extra_env={"OMA_DEEP_FOLLOW_SECONDS": "5"})
+        th.join()
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertEqual(self.dm_calls(), [])
+
+    def test_l3_exit_rechecks_state_after_lock(self):
+        import fcntl, time
+        self.ready_to_exit()
+        lock = self.deep_dir / "deep.lock"
+        fh = open(lock, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        proc = subprocess.Popen([str(OMA_BIN), "disable"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=self.env())
+        time.sleep(1.5)                       # the CLI is now waiting in flock -w 10
+        (self.deep_dir / "deep.json").unlink()  # the other exit finished
+        fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+        out, _ = proc.communicate(timeout=30)
+        out = ANSI_RE.sub("", out)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Already restored", out)
+        self.assertEqual(self.dm_calls(), [])
+
+    def test_l3_guard_is_right_after_flock(self):
+        src = (ROOT / "lib/deep.sh").read_text()
+        body = src.split("deep_exit_transaction() {", 1)[1]
+        after = body.split("if ! flock -w 10 201; then", 1)[1].split("fi", 1)[1]
+        first = [l.strip() for l in after.splitlines() if l.strip() and not l.strip().startswith("#")][0]
+        self.assertTrue(first.startswith("deep_state_exists || { exec 201>&-;"), first)
+
+    # ---- INFO-9 ----
+    def test_info9_console_on_stdout_only_is_detected(self):
+        if not shutil.which("script"):
+            self.skipTest("util-linux 'script' not available")
+        self.ready_to_exit()
+        out = self.run_on_console_fd1_only()
+        self.assertIn("__RC=0", out)
+        self.assertTrue(any("--unit=oma-server-deep-exit" in c for c in self.calls()), self.calls())
+        self.assertIsNone(self.deep_state())
+
+    def test_info9_uses_proc_readlink(self):
+        src = (ROOT / "lib/deep.sh").read_text().split("deep_on_console() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('t=$(readlink -- "/proc/$$/fd/$fd" 2>/dev/null)', src)
+        self.assertNotIn("tty <&", src)
+
+    def test_info9_console_override_needs_test_mode(self):
+        self.ready_to_exit()
+        env = {"OMA_SERVER_TEST_MODE": "0", "OMA_DEEP_TEST_CONSOLE": "/dev/null"}
+        self.cli("disable", extra_env=env)
+        self.assertFalse(any("--unit=oma-server-deep-exit" in c for c in self.calls()))
+
+    # ---- trap save/restore ----
+    def test_tmp_guard_restores_earlier_traps(self):
+        script = f"""
+source "{ROOT}/lib/ui.sh" 2>/dev/null || true
+source "{ROOT}/lib/deep.sh"
+trap 'echo mine-int' INT
+trap 'echo mine-term' TERM
+deep_tmp_guard /tmp/x1
+trap -p INT | grep -q _deep_tmp_on_signal && echo armed
+deep_tmp_release
+trap -p INT TERM HUP
+"""
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=self.env(), timeout=10)
+        self.assertIn("armed", res.stdout, res.stderr)
+        self.assertIn("trap -- 'echo mine-int' SIGINT", res.stdout)
+        self.assertIn("trap -- 'echo mine-term' SIGTERM", res.stdout)
+        self.assertNotIn("HUP", res.stdout)
+
+    def test_uninstall_restores_earlier_traps(self):
+        src = (ROOT / "uninstall.sh").read_text()
+        self.assertIn("UNINSTALL_SAVED_TRAPS=$(trap -p INT TERM HUP)", src)
+        self.assertIn('eval "$UNINSTALL_SAVED_TRAPS"', src)
+
+    # ---- L-new-1: profile first, config after ----
+    def test_refused_profile_leaves_config_unchanged(self):
+        self.profile().write_text(f"a\n{self.BEGIN}\nx\n")
+        before = self.cfg.read_text()
+        for choice in ("btop", "none"):
+            with self.subTest(choice=choice):
+                res = self.cli("deep-shell", choice)
+                self.assertNotEqual(res.returncode, 0, res.plain)
+                self.assertEqual(self.cfg.read_text(), before)
+        self.assertRegex(self.cli("deep-shell").plain, r"\* none")
+
+    def test_refused_symlink_profile_leaves_config_unchanged(self):
+        real = self.base / "dot"; real.write_text("")
+        self.profile().symlink_to(real)
+        before = self.cfg.read_text()
+        self.assertNotEqual(self.cli("deep-shell", "custom", "--command", "htop").returncode, 0)
+        self.assertEqual(self.cfg.read_text(), before)
+
+    def test_config_failure_rolls_back_new_profile_block(self):
+        self.profile().write_text("export FOO=1\n")
+        os.chmod(self.cfg_dir, 0o500)       # mktemp in the config dir fails
+        try:
+            res = self.cli("deep-shell", "tmux")
+        finally:
+            os.chmod(self.cfg_dir, 0o755)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("rolled back", res.plain)
+        self.assertEqual(self.profile().read_text(), "export FOO=1\n")
+        self.assertIn('shell = "none"', self.cfg.read_text())
+
+    # ---- custom command warnings ----
+    def test_custom_missing_program_warns(self):
+        res = self.cli("deep-shell", "custom", "--command", "FOO=1 no-such-prog-xyz --flag")
+        self.assertEqual(res.returncode, 0, res.plain)
+        self.assertIn("'no-such-prog-xyz' is not installed", res.plain)
+        res2 = self.cli("deep-shell", "custom", "--command", "bash -c true")
+        self.assertNotIn("not installed", res2.plain)
+
+    # ---- quickshell PID lookup ----
+    def test_quickshell_lookup_ignores_omarchy_shell_wrapper(self):
+        for f in ("lib/snapshot.sh", "lib/transition.sh"):
+            src = (ROOT / f).read_text()
+            self.assertNotIn('pgrep -u "$current_uid" -x "omarchy-shell"', src, f)
+            self.assertIn('pgrep -o -u "$current_uid" -x "quickshell"', src, f)
+        self.assertNotIn('"quickshell|omarchy-shell"', (ROOT / "lib/transition.sh").read_text())
+
+    def test_quickshell_lookup_picks_real_shell_process(self):
+        # A long-lived `quickshell` and a transient `omarchy-shell shell ping` wrapper.
+        d = self.base / "procs"; d.mkdir()
+        qs = d / "quickshell"; wrap = d / "omarchy-shell"
+        for f in (qs, wrap):
+            write_executable(f, "#!/bin/bash\nsleep 30\n")
+        p_qs = subprocess.Popen([str(qs)])
+        p_wrap = subprocess.Popen([str(wrap), "shell", "ping"])
+        try:
+            import time; time.sleep(0.3)
+            script = f"""
+source "{ROOT}/lib/transition.sh"
+get_quickshell_telemetry
+"""
+            env = self.env(); env["PATH"] = "/usr/bin:/bin"
+            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=10)
+            self.assertIn(f"PID: {p_qs.pid}", res.stdout, res.stderr)
+            self.assertNotIn(f"PID: {p_wrap.pid}", res.stdout)
+        finally:
+            p_qs.kill(); p_wrap.kill(); p_qs.wait(); p_wrap.wait()
+
+    # ---- README ----
+    def test_readme_documents_wait_and_tuios_daemon(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("OMA_DEEP_SHELL_WAIT", readme)
+        self.assertIn("tuios daemon", readme)
 
 
 if __name__ == "__main__":
