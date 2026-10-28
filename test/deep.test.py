@@ -2450,6 +2450,43 @@ trap -p INT TERM HUP
         self.assertEqual(self.profile().read_text(), "export FOO=1\n")
         self.assertIn('shell = "none"', self.cfg.read_text())
 
+    # ---- INFO-10: failed `shell` write restores the old shell_command ----
+    def test_info10_failed_shell_write_restores_old_command(self):
+        self.cfg.write_text(self.cfg.read_text().replace('shell = "none"', 'shell = "custom"')
+                            .replace('shell_command = ""', 'shell_command = "htop -d 20"'))
+        # awk refuses only the `shell` key rewrite; shell_command writes still work.
+        write_executable(self.bin / "awk", """#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "k=shell" ]] && exit 1; done
+exec /usr/bin/awk "$@"
+""")
+        res = self.cli("deep-shell", "custom", "--command", "top -d 2")
+        self.assertNotEqual(res.returncode, 0, res.plain)
+        self.assertIn("rolled back", res.plain)
+        cfg = self.cfg.read_text()
+        self.assertIn('shell_command = "htop -d 20"', cfg)
+        self.assertNotIn("top -d 2\"", cfg.replace('"htop -d 20"', ""))
+        self.assertIn('shell = "custom"', cfg)
+        self.assertEqual([p.name for p in self.cfg_dir.iterdir() if p.name.startswith("config.toml.")], [])
+
+    # ---- INFO-11: console override needs the guarded test root ----
+    def on_console_probe(self, with_root):
+        if not shutil.which("script"):
+            self.skipTest("util-linux 'script' not available")
+        env = self.env({"OMA_SERVER_TEST_MODE": "1"})
+        if not with_root:
+            env.pop("OMA_SERVER_TEST_ROOT")
+        script = (f'export OMA_DEEP_TEST_CONSOLE="$(tty)"; source "{ROOT}/lib/deep.sh"; '
+                  'deep_on_console && echo __CONSOLE=yes || echo __CONSOLE=no')
+        res = subprocess.run(["script", "-qec", f"bash -c '{script}'", "/dev/null"], input="",
+                             capture_output=True, text=True, env=env, timeout=30)
+        return res.stdout + res.stderr
+
+    def test_info11_console_override_ignored_without_test_root(self):
+        self.assertIn("__CONSOLE=no", self.on_console_probe(with_root=False))
+
+    def test_info11_console_override_works_with_test_root(self):
+        self.assertIn("__CONSOLE=yes", self.on_console_probe(with_root=True))
+
     # ---- custom command warnings ----
     def test_custom_missing_program_warns(self):
         res = self.cli("deep-shell", "custom", "--command", "FOO=1 no-such-prog-xyz --flag")

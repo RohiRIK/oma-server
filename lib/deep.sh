@@ -984,7 +984,8 @@ deep_on_console() {
     [[ -n "${OMA_DEEP_SHELL_ACTIVE:-}" ]] && return 0
     local fd t console="/dev/tty1"
     # Test mode only: the sandbox runs on a pty, so let tests name the console.
-    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "${OMA_DEEP_TEST_CONSOLE:-}" ]] && console="$OMA_DEEP_TEST_CONSOLE"
+    # INFO-11: only with the guarded test root (deep_guard_test_root), never TEST_MODE alone.
+    [[ "${OMA_SERVER_TEST_MODE:-}" == 1 && -n "$DEEP_ROOT_PREFIX" && -n "${OMA_DEEP_TEST_CONSOLE:-}" ]] && console="$OMA_DEEP_TEST_CONSOLE"
     for fd in 0 1 2; do
         [[ -t "$fd" ]] || continue
         # INFO-9: read the fd's target from /proc; `tty` inside $() would see the
@@ -1530,10 +1531,22 @@ deep_shell_cmd() {
     fi
     [[ -x "$launcher" ]] || { ui_log_fail "Launcher '$launcher' missing; re-run install.sh."; return 1; }
     deep_shell_profile_add "$prof" "$launcher" || return 1
-    if { [[ "$choice" == custom ]] && ! deep_config_set_string "$config_file" "shell_command" "$2"; } ||
-            ! deep_config_set_string "$config_file" "shell" "$choice"; then
+    # INFO-10: remember the old command so a failed `shell` write never leaves a new
+    # shell_command live (when the current choice is already custom) while we report failure.
+    local old_cmd; old_cmd=$(config_get_scalar "$config_file" "deep" "shell_command" "")
+    local cmd_written=0 cfg_ok=1
+    if [[ "$choice" == custom ]]; then
+        if deep_config_set_string "$config_file" "shell_command" "$2"; then cmd_written=1; else cfg_ok=0; fi
+    fi
+    if (( cfg_ok )) && ! deep_config_set_string "$config_file" "shell" "$choice"; then
+        cfg_ok=0
+    fi
+    if (( ! cfg_ok )); then
+        if (( cmd_written )) && ! deep_config_set_string "$config_file" "shell_command" "$old_cmd"; then
+            ui_log_warn "Could not restore the previous [deep] shell_command in '$config_file'; check it by hand."
+        fi
         [[ "$current" == none ]] && deep_shell_profile_remove "$prof" >/dev/null 2>&1
-        ui_log_fail "Could not update [deep] shell in '$config_file'; the profile was rolled back."
+        ui_log_fail "Could not update [deep] shell in '$config_file'; the profile and shell_command were rolled back."
         return 1
     fi
     local b; b=$(deep_shell_binary "$choice")
